@@ -60,7 +60,7 @@ class Settings:
     @property
     def base_url(self) -> str:
         # Kalshi quickstart examples use demo-api.kalshi.co and api.kalshi.com
-        return "https://demo-api.kalshi.co" if self.KALSHI_ENV == "demo" else "https://api.kalshi.com"
+        return "https://demo-api.kalshi.co" if self.KALSHI_ENV == "demo" else "https://api.elections.kalshi.com"
 
     def validate(self) -> None:
         if not self.KALSHI_API_KEY_ID:

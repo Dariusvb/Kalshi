@@ -38,7 +38,6 @@ def _parse_dt(x: Any) -> Optional[dt.datetime]:
     if not s:
         return None
     try:
-        # Handles iso strings like "2026-02-25T00:00:00Z"
         s = s.replace("Z", "+00:00")
         parsed = dt.datetime.fromisoformat(s)
         return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
@@ -46,10 +45,18 @@ def _parse_dt(x: Any) -> Optional[dt.datetime]:
         return None
 
 
+def _normalize_title_for_fingerprint(title: str) -> str:
+    t = (title or "").strip().lower()
+    # light normalization (intentionally simple/no regex dependency)
+    for ch in ["|", "-", "—", ":", ";", ",", ".", "!", "?", "(", ")", "[", "]", "{", "}", '"', "'"]:
+        t = t.replace(ch, " ")
+    t = " ".join(t.split())
+    return t
+
+
 def _headline_noise_penalty(title: str) -> float:
     t = (title or "").lower()
     penalty = 0.0
-    # crude clickbait/noise heuristics (bounded)
     clickbait_terms = [
         "shocking", "you won't believe", "slams", "destroys", "explodes",
         "rumor", "rumour", "unverified", "viral", "watch:", "must see"
@@ -70,7 +77,6 @@ def _dedupe_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         src = str(it.get("source") or "").strip().lower()
         url = str(it.get("url") or "").strip().lower()
 
-        # URL if available; fallback title-source fingerprint
         key = url or f"{src}|{title}"
         if not key:
             continue
@@ -81,14 +87,40 @@ def _dedupe_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+def _count_near_duplicate_headlines(items: list[dict[str, Any]]) -> int:
+    """
+    Counts repeated normalized headlines across items (syndication/noise proxy).
+    Example:
+      same/similar headline reposted across many low-tier sites.
+    """
+    counts: dict[str, int] = {}
+    for it in items:
+        fp = _normalize_title_for_fingerprint(str(it.get("title") or ""))
+        if not fp:
+            continue
+        counts[fp] = counts.get(fp, 0) + 1
+
+    # count duplicate *extra* occurrences, not unique keys
+    duplicate_excess = 0
+    for _, n in counts.items():
+        if n > 1:
+            duplicate_excess += (n - 1)
+    return duplicate_excess
+
+
 def _recency_weight(published_at: Any, now_utc: Optional[dt.datetime] = None) -> float:
     now_utc = now_utc or dt.datetime.now(dt.timezone.utc)
     pub = _parse_dt(published_at)
     if pub is None:
-        return 0.35  # unknown timestamp -> low confidence
-    age_minutes = max(0.0, (now_utc - pub).total_seconds() / 60.0)
+        return 0.35
 
-    # Not too aggressive; older news can still matter, but less
+    # Future timestamps can happen due to bad feeds / timezone bugs.
+    # Treat as low-confidence instead of high-confidence.
+    age_minutes = (now_utc - pub).total_seconds() / 60.0
+    if age_minutes < -5:
+        return 0.25
+    age_minutes = max(0.0, age_minutes)
+
     if age_minutes <= 30:
         return 1.00
     if age_minutes <= 120:
@@ -128,15 +160,11 @@ def _extract_fact_weight(item: dict[str, Any]) -> float:
     """
     Placeholder for structured fact extraction.
     For now uses simple metadata flags if present.
-    You can later feed this from a parser.
     """
-    # If upstream collector tags this as official-confirmed etc.
     if item.get("official_confirmation") is True:
         return 1.0
     if item.get("secondary_confirmation") is True:
         return 0.6
-
-    # fallback: generic neutral
     return 0.35
 
 
@@ -168,23 +196,44 @@ def evaluate_news_signal(
       ]
     """
     if not enabled:
-        return NewsSignalResult(enabled=False, score=0.0, confidence=0.0, regime="disabled", reasons=["news_disabled"])
+        return NewsSignalResult(
+            enabled=False,
+            score=0.0,
+            confidence=0.0,
+            regime="disabled",
+            reasons=["news_disabled"],
+        )
 
     category = str(market_snapshot.get("category") or "").strip().lower()
     if category_allowlist:
         allowed = [c.lower() for c in category_allowlist]
         if category and category not in allowed:
             return NewsSignalResult(
-                enabled=True, score=0.0, confidence=0.0, regime="category_disabled",
-                reasons=[f"news_disabled_for_category:{category}"]
+                enabled=True,
+                score=0.0,
+                confidence=0.0,
+                regime="category_disabled",
+                reasons=[f"news_disabled_for_category:{category}"],
             )
 
     if not news_items:
-        return NewsSignalResult(enabled=True, score=0.0, confidence=0.0, regime="unavailable", reasons=["no_news_items"])
+        return NewsSignalResult(
+            enabled=True,
+            score=0.0,
+            confidence=0.0,
+            regime="unavailable",
+            reasons=["no_news_items"],
+        )
 
     items = _dedupe_items(news_items)
     if not items:
-        return NewsSignalResult(enabled=True, score=0.0, confidence=0.0, regime="unavailable", reasons=["all_items_deduped"])
+        return NewsSignalResult(
+            enabled=True,
+            score=0.0,
+            confidence=0.0,
+            regime="unavailable",
+            reasons=["all_items_deduped"],
+        )
 
     weighted_yes = 0.0
     weighted_no = 0.0
@@ -195,6 +244,9 @@ def evaluate_news_signal(
 
     tier1_count = tier2_count = tier3_count = 0
     credible_sources = set()
+    credible_yes_sources = set()
+    credible_no_sources = set()
+
     now_utc = dt.datetime.now(dt.timezone.utc)
 
     for it in items:
@@ -218,6 +270,7 @@ def evaluate_news_signal(
         # strength defaults to moderate
         strength = max(0.0, min(1.0, _safe_float(it.get("strength"), 0.5)))
 
+        # quality bounded per-item
         item_quality = (src.weight * recency * (0.5 + fact_weight)) - (0.15 * clickbait_penalty)
         item_quality = max(0.0, min(1.5, item_quality))
         total_quality += item_quality
@@ -225,8 +278,12 @@ def evaluate_news_signal(
         direction = str(it.get("direction_hint") or "NEUTRAL").upper().strip()
         if direction == "YES":
             weighted_yes += item_quality * strength
+            if src.tier in (1, 2):
+                credible_yes_sources.add(src.domain)
         elif direction == "NO":
             weighted_no += item_quality * strength
+            if src.tier in (1, 2):
+                credible_no_sources.add(src.domain)
         else:
             weighted_neutral += item_quality * max(0.25, strength)
 
@@ -235,45 +292,97 @@ def evaluate_news_signal(
             risk_flags.append("tier3_source_present")
         if clickbait_penalty >= 1.5:
             risk_flags.append("clickbait_like_headline_present")
+        if recency <= 0.25:
+            risk_flags.append("stale_or_bad_timestamp_present")
+
+    # Syndication / repeated-headline penalty (helps avoid fake "consensus")
+    duplicate_headline_excess = _count_near_duplicate_headlines(items)
+    if duplicate_headline_excess > 0:
+        reasons.append(f"headline_dup_excess={duplicate_headline_excess}")
+        risk_flags.append("headline_syndication_or_duplication")
+
+        # modest penalty only; don't nuke legitimate wire pickup
+        total_quality *= max(0.75, 1.0 - min(0.20, duplicate_headline_excess * 0.03))
+        weighted_yes *= max(0.80, 1.0 - min(0.15, duplicate_headline_excess * 0.025))
+        weighted_no *= max(0.80, 1.0 - min(0.15, duplicate_headline_excess * 0.025))
 
     # Agreement / conflict
     directional_total = weighted_yes + weighted_no
     if directional_total <= 0.01:
         reasons.append("no_directional_news_edge")
         raw_score = 0.0
+        direction_bias = 0.0
+        imbalance = 0.0
     else:
         direction_bias = (weighted_yes - weighted_no) / max(0.001, directional_total)
-        # scale to bounded raw score
         raw_score = direction_bias * min(max_abs_score, 2.0 + total_quality * 2.5)
 
-        # conflicting reporting penalty (if both yes and no weighted support are substantial)
         imbalance = abs(weighted_yes - weighted_no) / max(0.001, directional_total)
+
+        # conflicting reporting penalty if both sides have substantial support
         if directional_total > 0.6 and imbalance < 0.35:
             raw_score *= 0.5
             reasons.append("conflicting_reports_penalty")
             risk_flags.append("conflicting_reports")
 
-    # require multiple credible confirmations for positive boost
-    if require_two_credible_sources_for_boost and raw_score > 0:
-        if len(credible_sources) < 2:
-            raw_score = min(raw_score, 2.0)  # can still be mildly positive, not strong
-            reasons.append("limited_credible_confirmation_cap")
-            risk_flags.append("insufficient_credible_sources")
+        # if lots of neutral relative to directional, confidence/signal should be softer
+        if weighted_neutral > directional_total * 0.75:
+            raw_score *= 0.85
+            reasons.append("high_neutral_share_penalty")
+            risk_flags.append("high_neutral_news_share")
 
-    # Market already moved? penalize chasing
+    # Require multiple credible confirmations for strong directional boost/cut (symmetrical)
+    if require_two_credible_sources_for_boost:
+        if raw_score > 0 and len(credible_yes_sources) < 2:
+            raw_score = min(raw_score, 2.0)
+            reasons.append("limited_credible_yes_confirmation_cap")
+            risk_flags.append("insufficient_credible_yes_sources")
+        elif raw_score < 0 and len(credible_no_sources) < 2:
+            raw_score = max(raw_score, -2.0)
+            reasons.append("limited_credible_no_confirmation_cap")
+            risk_flags.append("insufficient_credible_no_sources")
+
+    # Market already moved? penalize chasing mostly when following the move.
+    # Since we don't know move direction here, apply full penalty only to positive score,
+    # and reduced penalty to negative score (keeps shorts/NO signals from being over-muted).
     chase_penalty = _market_move_exhaustion_penalty(market_snapshot)
     if chase_penalty > 0:
-        raw_score = raw_score - chase_penalty if raw_score > 0 else raw_score - (0.4 * chase_penalty)
+        if raw_score > 0:
+            raw_score -= chase_penalty
+        elif raw_score < 0:
+            raw_score -= (0.25 * chase_penalty)  # smaller effect than before
         reasons.append(f"market_move_exhaustion_penalty:{chase_penalty:.1f}")
 
     # Bound final score
     score = max(-max_abs_score, min(max_abs_score, raw_score))
 
-    # Confidence
+    # Confidence: combine quality, source diversity, and directional agreement
     quality_norm = max(0.0, min(1.0, total_quality / 4.0))
     source_diversity = max(0.0, min(1.0, len(credible_sources) / 3.0))
-    confidence = round(max(0.0, min(1.0, 0.55 * quality_norm + 0.45 * source_diversity)), 3)
 
+    if directional_total <= 0.01:
+        agreement_norm = 0.0
+    else:
+        agreement_norm = max(0.0, min(1.0, abs(direction_bias)))  # 0 mixed, 1 one-sided
+
+    confidence = round(
+        max(
+            0.0,
+            min(
+                1.0,
+                0.45 * quality_norm + 0.30 * source_diversity + 0.25 * agreement_norm
+            ),
+        ),
+        3,
+    )
+
+    # confidence dampeners for noisy conditions
+    if "conflicting_reports" in risk_flags:
+        confidence = round(max(0.0, confidence * 0.80), 3)
+    if "clickbait_like_headline_present" in risk_flags and tier1_count == 0:
+        confidence = round(max(0.0, confidence * 0.85), 3)
+
+    # Regime classification
     if abs(score) < 1.5:
         regime = "noisy_or_weak"
     elif "conflicting_reports" in risk_flags:
@@ -289,6 +398,8 @@ def evaluate_news_signal(
         reasons.append("1_tier1_source")
 
     reasons.append(f"credible_sources={len(credible_sources)}")
+    reasons.append(f"credible_yes_sources={len(credible_yes_sources)}")
+    reasons.append(f"credible_no_sources={len(credible_no_sources)}")
     reasons.append(f"news_items={len(news_items)}")
     reasons.append(f"news_unique={len(items)}")
 

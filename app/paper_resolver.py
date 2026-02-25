@@ -18,8 +18,7 @@ def _parse_iso(ts: str) -> Optional[dt.datetime]:
     if not ts:
         return None
     try:
-        # tolerate Z suffix
-        ts = ts.replace("Z", "+00:00")
+        ts = ts.replace("Z", "+00:00")  # tolerate Z suffix
         parsed = dt.datetime.fromisoformat(ts)
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=dt.UTC)
@@ -30,8 +29,7 @@ def _parse_iso(ts: str) -> Optional[dt.datetime]:
 
 def _extract_entry_price_cents_from_reasons(reasons: str) -> Optional[int]:
     """
-    Optional parser if you later include 'entry_price_cents:XX' in reasons.
-    Current MVP may not store this, so resolver will fallback to estimate.
+    Optional parser if 'entry_price_cents:XX' is stored in reasons.
     """
     if not reasons:
         return None
@@ -56,18 +54,14 @@ def _estimate_entry_price_from_decision(row: dict) -> Optional[int]:
         return None
 
     conv = float(row.get("final_conviction", 50.0))
-    # map conviction to rough entry range, capped
-    # e.g. stronger conviction -> willing to pay a bit more for YES / sell NO
-    # This is intentionally conservative.
     implied = int(round(max(5, min(95, 50 + (conv - 50) * 0.35))))
 
     if direction == "YES":
         return implied
-    else:
-        # For NO buys, price paid corresponds to NO price; in yes-space that is (100 - no_price)
-        # We return yes-space entry reference for pnl calc convenience.
-        no_price = implied
-        return 100 - no_price
+
+    # For NO buys, convert estimated NO entry into yes-space reference
+    no_price = implied
+    return 100 - no_price
 
 
 def _paper_pnl_from_mark(
@@ -79,19 +73,7 @@ def _paper_pnl_from_mark(
 ) -> float:
     """
     Approximate paper PnL using yes-price mark-to-market.
-    stake_dollars -> number of contracts approx = stake / entry_price_for_side
-
-    For YES buy:
-      contracts ≈ stake / (entry_yes_price/100)
-      pnl ≈ contracts * ((mark_yes - entry_yes)/100)
-
-    For NO buy:
-      entry_no = 100 - entry_yes
-      mark_no = 100 - mark_yes
-      contracts ≈ stake / (entry_no/100)
-      pnl ≈ contracts * ((mark_no - entry_no)/100)
-
-    This is a simplification; ignores fees/slippage/partial fills.
+    Ignores fees/slippage/partial fills (MVP approximation).
     """
     direction = direction.upper()
     entry_yes = max(1, min(99, int(entry_yes_price_cents)))
@@ -115,6 +97,39 @@ def _paper_pnl_from_mark(
         return round(pnl, 4)
 
     return 0.0
+
+
+def _extract_minimal_market_quality(summary: dict) -> dict:
+    """
+    Pull a few quality indicators from summarize_market with safe defaults.
+    This avoids relying too heavily on exact schema shape.
+    """
+    spread = summary.get("spread_cents", None)
+    volume = summary.get("volume", None)
+    mid_yes = summary.get("mid_yes_cents", None)
+    status = str(summary.get("status", "unknown")).lower()
+
+    try:
+        spread = None if spread is None else int(round(float(spread)))
+    except Exception:
+        spread = None
+
+    try:
+        volume = None if volume is None else float(volume)
+    except Exception:
+        volume = None
+
+    try:
+        mid_yes = None if mid_yes is None else int(round(float(mid_yes)))
+    except Exception:
+        mid_yes = None
+
+    return {
+        "spread_cents": spread,
+        "volume": volume,
+        "mid_yes_cents": mid_yes,
+        "status": status,
+    }
 
 
 def resolve_paper_trades(
@@ -142,11 +157,22 @@ def resolve_paper_trades(
     checked = 0
     skipped = 0
 
+    # Guardrails so learning isn't trained on garbage marks.
+    # These are intentionally permissive (not too conservative).
+    max_resolve_spread_cents = 12
+    min_resolve_volume = 1.0
+
+    # If pnl is near-zero, don't force a win/loss label.
+    flat_pnl_epsilon = 0.10  # $0.10
+
     for row in rows:
         checked += 1
+
         ts = _parse_iso(str(row.get("ts", "")))
         if ts is None:
             skipped += 1
+            if logger:
+                logger.debug(f"Paper resolver skip id={row.get('id')} reason=bad_ts")
             continue
 
         age_min = (now - ts).total_seconds() / 60.0
@@ -157,18 +183,54 @@ def resolve_paper_trades(
         ticker = row.get("ticker")
         if not ticker:
             skipped += 1
+            if logger:
+                logger.debug(f"Paper resolver skip id={row.get('id')} reason=no_ticker")
             continue
 
+        # Pull current mark
         try:
             raw_market = client.get_market(str(ticker))
-            # summarize_market expects market dict; some endpoints may wrap object
             market_obj = raw_market
             if isinstance(raw_market, dict) and "market" in raw_market and isinstance(raw_market["market"], dict):
                 market_obj = raw_market["market"]
 
             s = summarize_market(market_obj)
-            mark_yes = int(round(float(s.get("mid_yes_cents", 50.0))))
+            quality = _extract_minimal_market_quality(s)
+
+            mark_yes = quality["mid_yes_cents"]
             market_category = str(s.get("category", "")) if s.get("category") is not None else None
+
+            if mark_yes is None:
+                skipped += 1
+                if logger:
+                    logger.debug(f"Paper resolver skip {ticker} reason=no_mark")
+                continue
+
+            # Avoid resolving on trash marks (wide or dead markets)
+            spread = quality["spread_cents"]
+            volume = quality["volume"]
+            status = quality["status"]
+
+            if spread is not None and spread > max_resolve_spread_cents:
+                skipped += 1
+                if logger:
+                    logger.debug(
+                        f"Paper resolver skip {ticker} reason=wide_spread spread={spread}>{max_resolve_spread_cents}"
+                    )
+                continue
+
+            if volume is not None and volume < min_resolve_volume:
+                skipped += 1
+                if logger:
+                    logger.debug(
+                        f"Paper resolver skip {ticker} reason=low_volume volume={volume}<{min_resolve_volume}"
+                    )
+                continue
+
+            # If clearly closed/resolved, that's fine; if still trading, also fine (mark-to-market model).
+            # We intentionally do NOT require final market resolution here.
+            _ = status
+
         except Exception as e:
             if logger:
                 logger.warning(f"Paper resolver market fetch failed for {ticker}: {e}")
@@ -178,14 +240,21 @@ def resolve_paper_trades(
         direction = str(row.get("direction", "SKIP")).upper()
         stake_dollars = float(row.get("stake_dollars", 0.0))
 
-        # Try exact simulated entry price if present; otherwise estimate.
+        # Try exact simulated entry price first; fallback to estimate.
         reasons = str(row.get("reasons", ""))
         entry_yes = _extract_entry_price_cents_from_reasons(reasons)
+        entry_source = "logged"
         if entry_yes is None:
             entry_yes = _estimate_entry_price_from_decision(row)
+            entry_source = "estimated"
 
         if entry_yes is None or direction not in {"YES", "NO"} or stake_dollars <= 0:
             skipped += 1
+            if logger:
+                logger.debug(
+                    f"Paper resolver skip id={row.get('id')} reason=bad_trade_fields "
+                    f"dir={direction} stake={stake_dollars} entry_yes={entry_yes}"
+                )
             continue
 
         pnl = _paper_pnl_from_mark(
@@ -194,21 +263,28 @@ def resolve_paper_trades(
             entry_yes_price_cents=entry_yes,
             mark_yes_price_cents=mark_yes,
         )
-        won = pnl > 0
+
+        # Don't overfit tiny noise moves into wins/losses
+        if abs(pnl) < flat_pnl_epsilon:
+            won_value = None
+        else:
+            won_value = bool(pnl > 0)
 
         try:
             store.update_decision_outcome(
                 decision_id=int(row["id"]),
                 realized_pnl=float(pnl),
-                won=bool(won),
+                won=won_value,
                 resolved_ts=now.isoformat(),
                 market_category=market_category,
             )
             updated += 1
+
             if logger:
                 logger.info(
                     f"Paper resolved id={row['id']} {ticker} dir={direction} "
-                    f"entry_yes={entry_yes} mark_yes={mark_yes} pnl={pnl:.4f} won={won}"
+                    f"entry_yes={entry_yes}({entry_source}) mark_yes={mark_yes} "
+                    f"stake={stake_dollars:.2f} pnl={pnl:.4f} won={won_value}"
                 )
         except Exception as e:
             if logger:

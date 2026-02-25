@@ -81,6 +81,15 @@ class BotApp:
         self.news_abs_effect_cap_on_conviction = 6.0      # final effective news impact cap
         self.news_allow_direction_flip = False            # don't let news reverse trade direction logic
 
+        # Conservative exit-management (thesis deterioration only; avoid paper hands)
+        self.exit_management_enabled = True
+        self.exit_min_hold_minutes = 5                    # avoid immediate churn after entry
+        self.exit_max_hold_conviction = 52.0              # if thesis drops to weak/skip-ish
+        self.exit_conviction_drop_points = 12.0           # large deterioration from entry conviction
+        self.exit_require_opposite_or_skip = True         # won't exit just because conviction wiggles
+        self.exit_news_conflict_min_conf = 0.75           # only trust strong/confident conflicting news
+        self.exit_news_conflict_min_effect = 2.5          # adverse effective news score threshold
+
         # Scorecard cadence (every N ticks)
         self.scorecard_summary_every_n_ticks = 30
 
@@ -125,6 +134,460 @@ class BotApp:
 
         snap.daily_pnl_dollars = 0.0
         return snap
+
+    # -----------------------------
+    # Position / exit helpers
+    # -----------------------------
+    def _to_float(self, v: Any) -> Optional[float]:
+        try:
+            if v is None:
+                return None
+            if isinstance(v, bool):
+                return None
+            return float(v)
+        except Exception:
+            return None
+
+    def _extract_positions_list(self, payload: Any) -> list[dict]:
+        if isinstance(payload, dict):
+            p = payload.get("positions")
+            if isinstance(p, list):
+                return [x for x in p if isinstance(x, dict)]
+        if isinstance(payload, list):
+            return [x for x in payload if isinstance(x, dict)]
+        return []
+
+    def _position_ticker(self, p: dict) -> str:
+        for k in ("ticker", "market_ticker", "event_ticker", "instrument_ticker"):
+            v = p.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        return ""
+
+    def _position_contract_side(self, p: dict) -> Optional[str]:
+        """
+        Normalize position side to 'YES' or 'NO' if possible.
+        Accepts several likely payload variants.
+        """
+        for k in ("yes_no", "side", "position_side", "contract_side", "outcome"):
+            v = p.get(k)
+            if v is None:
+                continue
+            s = str(v).strip().upper()
+            if s in {"YES", "Y"}:
+                return "YES"
+            if s in {"NO", "N"}:
+                return "NO"
+
+        # Some payloads expose counts split by side
+        yes_qty = self._to_float(p.get("yes_count") or p.get("yes_position") or p.get("yes_contracts"))
+        no_qty = self._to_float(p.get("no_count") or p.get("no_position") or p.get("no_contracts"))
+        if yes_qty and yes_qty > 0 and (not no_qty or no_qty <= 0):
+            return "YES"
+        if no_qty and no_qty > 0 and (not yes_qty or yes_qty <= 0):
+            return "NO"
+        return None
+
+    def _position_count(self, p: dict) -> int:
+        for k in ("count", "contracts", "qty", "quantity", "position", "open_interest"):
+            v = self._to_float(p.get(k))
+            if v is not None and v > 0:
+                return max(0, int(round(v)))
+        # Side-specific fallbacks
+        for k in ("yes_count", "yes_contracts", "yes_position", "no_count", "no_contracts", "no_position"):
+            v = self._to_float(p.get(k))
+            if v is not None and v > 0:
+                return max(0, int(round(v)))
+        return 0
+
+    def _position_entry_price_cents(self, p: dict) -> Optional[int]:
+        for k in ("avg_price_cents", "average_price_cents", "entry_price_cents", "cost_basis_price_cents"):
+            v = self._to_float(p.get(k))
+            if v is not None:
+                return int(round(v))
+        return None
+
+    def _position_open_ts(self, p: dict) -> Optional[dt.datetime]:
+        for k in ("opened_ts", "opened_at", "created_ts", "created_at", "updated_at", "ts"):
+            raw = p.get(k)
+            if not raw:
+                continue
+            try:
+                s = str(raw).replace("Z", "+00:00")
+                d = dt.datetime.fromisoformat(s)
+                if d.tzinfo is None:
+                    d = d.replace(tzinfo=dt.UTC)
+                return d.astimezone(dt.UTC)
+            except Exception:
+                continue
+        return None
+
+    def _find_open_position_for_ticker(self, ticker: str) -> Optional[dict]:
+        try:
+            raw = self.client.get_positions()
+            positions = self._extract_positions_list(raw)
+        except Exception as e:
+            self.logger.warning(f"Position scan for exits failed: {e}")
+            return None
+
+        for p in positions:
+            if self._position_ticker(p) != ticker:
+                continue
+            count = self._position_count(p)
+            side = self._position_contract_side(p)
+            if count > 0 and side in {"YES", "NO"}:
+                return p
+        return None
+
+    def _latest_entry_context_for_ticker(self, ticker: str) -> dict:
+        """
+        Best-effort lookup of last entry trade recorded for this ticker in current mode.
+        """
+        out = {
+            "entry_conviction": None,
+            "entry_ts": None,
+            "entry_price_cents": None,
+            "entry_action": None,
+        }
+        try:
+            rows = self.store.recent_decisions(250)
+        except Exception:
+            return out
+
+        for r in rows:
+            if bool(r.get("dry_run", True)) != bool(self.settings.DRY_RUN):
+                continue
+            if str(r.get("ticker", "")) != str(ticker):
+                continue
+            action = str(r.get("action", ""))
+            if not action.startswith("TRADE_"):
+                continue
+            if action.startswith("TRADE_EXIT"):
+                continue
+            out["entry_conviction"] = self._to_float(r.get("final_conviction"))
+            out["entry_ts"] = r.get("ts")
+            out["entry_action"] = action
+            reasons = str(r.get("reasons", "") or "")
+            marker = "entry_price_cents:"
+            idx = reasons.find(marker)
+            if idx >= 0:
+                tail = reasons[idx + len(marker):]
+                val = tail.split(";", 1)[0].strip()
+                try:
+                    out["entry_price_cents"] = int(float(val))
+                except Exception:
+                    pass
+            return out
+        return out
+
+    def _minutes_since(self, ts_like: Any) -> Optional[float]:
+        if ts_like is None:
+            return None
+        try:
+            s = str(ts_like).replace("Z", "+00:00")
+            d = dt.datetime.fromisoformat(s)
+            if d.tzinfo is None:
+                d = d.replace(tzinfo=dt.UTC)
+            return max(0.0, (dt.datetime.now(dt.UTC) - d.astimezone(dt.UTC)).total_seconds() / 60.0)
+        except Exception:
+            return None
+
+    def _build_conservative_exit_order(self, chosen: dict, pos: dict) -> Optional[dict]:
+        """
+        Build a simple exit order by SELLING the held contract side at (best bid if available),
+        with safe fallbacks. Conservative and minimal to avoid breaking entry flow.
+        """
+        side = self._position_contract_side(pos)
+        count = self._position_count(pos)
+        if side not in {"YES", "NO"} or count <= 0:
+            return None
+
+        yes_bid = self._to_float(chosen.get("yes_bid")) or 0.0
+        yes_ask = self._to_float(chosen.get("yes_ask")) or 0.0
+        no_bid = self._to_float(chosen.get("no_bid")) or 0.0
+        no_ask = self._to_float(chosen.get("no_ask")) or 0.0
+        mid = self._to_float(chosen.get("mid_yes_cents")) or 50.0
+
+        if side == "YES":
+            px = int(round(yes_bid)) if yes_bid > 0 else int(max(1, min(99, round(mid) - 1)))
+            yes_no = "yes"
+        else:
+            # Prefer explicit no_bid; otherwise infer from yes_ask if present
+            if no_bid > 0:
+                px = int(round(no_bid))
+            elif yes_ask > 0:
+                px = int(max(1, min(99, round(100 - yes_ask))))
+            else:
+                inferred_no_mid = 100 - mid
+                px = int(max(1, min(99, round(inferred_no_mid) - 1)))
+            yes_no = "no"
+
+        return {
+            "ticker": chosen["ticker"],
+            "side": "sell",
+            "yes_no": yes_no,
+            "count": int(count),
+            "price_cents": int(max(1, min(99, px))),
+            "client_order_id": f"exit-{chosen['ticker']}-{int(dt.datetime.now(dt.UTC).timestamp())}",
+            "held_side": side,
+        }
+
+    def _should_exit_on_thesis_deterioration(
+        self,
+        *,
+        chosen: dict,
+        sig: Any,
+        final_conviction: float,
+        news: dict,
+        news_applied: dict,
+    ) -> tuple[bool, list[str]]:
+        """
+        Conservative exit: only when thesis materially deteriorates.
+        """
+        if not self.exit_management_enabled:
+            return False, ["exit_mgmt_disabled"]
+
+        pos = self._find_open_position_for_ticker(str(chosen.get("ticker")))
+        if not pos:
+            return False, ["no_open_position_for_ticker"]
+
+        held_side = self._position_contract_side(pos)
+        held_count = self._position_count(pos)
+        if held_side not in {"YES", "NO"} or held_count <= 0:
+            return False, ["position_unparseable"]
+
+        # Hold-time guard (prefer position timestamp, fallback to DB entry ts)
+        held_minutes: Optional[float] = None
+        p_opened = self._position_open_ts(pos)
+        if p_opened is not None:
+            held_minutes = max(0.0, (dt.datetime.now(dt.UTC) - p_opened).total_seconds() / 60.0)
+        else:
+            entry_ctx = self._latest_entry_context_for_ticker(str(chosen.get("ticker")))
+            held_minutes = self._minutes_since(entry_ctx.get("entry_ts"))
+
+        reasons: list[str] = [f"exit_check_held_side:{held_side}", f"exit_check_count:{held_count}"]
+
+        if held_minutes is not None:
+            reasons.append(f"exit_check_held_mins:{held_minutes:.1f}")
+            if held_minutes < float(self.exit_min_hold_minutes):
+                reasons.append("exit_hold_guard")
+                return False, reasons
+
+        sig_dir = str(getattr(sig, "direction", "SKIP") or "SKIP").upper()
+        final_conv = float(final_conviction)
+
+        entry_ctx = self._latest_entry_context_for_ticker(str(chosen.get("ticker")))
+        entry_conv = self._to_float(entry_ctx.get("entry_conviction"))
+        if entry_conv is not None:
+            reasons.append(f"exit_entry_conv:{entry_conv:.1f}")
+            reasons.append(f"exit_conv_drop:{(entry_conv - final_conv):.1f}")
+
+        opposite_signal = (held_side == "YES" and sig_dir == "NO") or (held_side == "NO" and sig_dir == "YES")
+        weak_or_skip = (sig_dir == "SKIP") and (final_conv <= float(self.exit_max_hold_conviction))
+        conviction_collapsed = (
+            entry_conv is not None and (entry_conv - final_conv) >= float(self.exit_conviction_drop_points)
+        )
+
+        # Strong adverse news (only if high confidence and meaningfully adverse)
+        news_conf = float(news.get("confidence", 0.0) or 0.0)
+        eff_news = float(news_applied.get("effective_news_score", 0.0) or 0.0)
+        strong_adverse_news = (
+            (held_side == "YES" and eff_news <= -float(self.exit_news_conflict_min_effect))
+            or (held_side == "NO" and eff_news >= float(self.exit_news_conflict_min_effect))
+        ) and news_conf >= float(self.exit_news_conflict_min_conf)
+
+        reasons.extend([
+            f"exit_sig_dir:{sig_dir}",
+            f"exit_final_conv:{final_conv:.1f}",
+            f"exit_opp_sig:{1 if opposite_signal else 0}",
+            f"exit_weak_or_skip:{1 if weak_or_skip else 0}",
+            f"exit_conv_collapse:{1 if conviction_collapsed else 0}",
+            f"exit_strong_adverse_news:{1 if strong_adverse_news else 0}",
+        ])
+
+        # Conservative rule:
+        # - opposite signal OR (skip+weak conviction)
+        # - and additionally conviction collapse OR strong adverse news OR opposite signal itself
+        if self.exit_require_opposite_or_skip:
+            if not (opposite_signal or weak_or_skip):
+                return False, reasons
+            if not (opposite_signal or conviction_collapsed or strong_adverse_news):
+                return False, reasons
+        else:
+            if not (opposite_signal or weak_or_skip or conviction_collapsed or strong_adverse_news):
+                return False, reasons
+
+        return True, reasons
+
+    def _record_decision_row(self, row: dict) -> Optional[int]:
+        inserted_id: Optional[int] = None
+        try:
+            inserted_id = self.store.insert_decision(row)
+        except TypeError:
+            legacy_row = {
+                "ts": row["ts"],
+                "ticker": row["ticker"],
+                "direction": row["direction"],
+                "base_conviction": row["base_conviction"],
+                "social_bonus": row["social_bonus"],
+                "final_conviction": row["final_conviction"],
+                "stake_dollars": row["stake_dollars"],
+                "action": row["action"],
+                "reasons": row["reasons"],
+                "dry_run": row["dry_run"],
+                "realized_pnl": row["realized_pnl"],
+                "won": row["won"],
+                "resolved_ts": row["resolved_ts"],
+                "market_category": row["market_category"],
+            }
+            inserted_id = self.store.insert_decision(legacy_row)
+
+            try:
+                if hasattr(self.store, "update_decision_metadata") and inserted_id is not None:
+                    self.store.update_decision_metadata(
+                        decision_id=int(inserted_id),
+                        updates={
+                            "news_score": row.get("news_score"),
+                            "news_confidence": row.get("news_confidence"),
+                            "news_regime": row.get("news_regime"),
+                            "news_effective_score": row.get("news_effective_score"),
+                            "spread_cents": row.get("spread_cents"),
+                        },
+                    )
+            except Exception as e:
+                self.logger.warning(f"Post-insert metadata patch failed (safe to ignore): {e}")
+        return inserted_id
+
+    def _post_tick_housekeeping(self, snapshot: PortfolioSnapshot) -> None:
+        if self.settings.DRY_RUN and self.paper_resolver_enabled:
+            try:
+                rr = resolve_paper_trades(
+                    store=self.store,
+                    client=self.client,
+                    logger=self.logger,
+                    max_to_check=self.paper_resolver_max_to_check,
+                    min_age_minutes=self.paper_resolver_min_age_minutes,
+                )
+                if rr.updated > 0:
+                    self.logger.info(
+                        f"Paper resolver updated={rr.updated} checked={rr.checked} skipped={rr.skipped}"
+                    )
+            except Exception as e:
+                self.logger.warning(f"Paper resolver failed: {e}")
+
+        recent20 = self.store.recent_decisions(20)
+        summary = summarize_decisions(recent20)
+        self.logger.info(f"Recent summary: {summary}")
+
+        recent50 = self.store.recent_decisions(50)
+        mode_stats = self._mode_stats_from_decisions(recent50)
+        self.logger.info(f"Mode stats (50): {mode_stats}")
+
+        self._maybe_send_periodic_summary(snapshot, recent50)
+        self._maybe_send_scorecard_summary()
+
+        if snapshot.cash_balance_dollars >= self.settings.WITHDRAWAL_ALERT_THRESHOLD_DOLLARS:
+            self.notifier.send(
+                f"💸 Cash balance appears >= ${self.settings.WITHDRAWAL_ALERT_THRESHOLD_DOLLARS:.0f}. "
+                f"Consider manual withdrawal via Kalshi UI."
+            )
+
+    def _maybe_manage_exit_for_chosen(
+        self,
+        *,
+        now: str,
+        chosen: dict,
+        sig: Any,
+        social: Any,
+        news: dict,
+        news_applied: dict,
+        final_conviction: float,
+    ) -> bool:
+        """
+        Best-effort thesis deterioration exit for an already-open position in the *currently chosen* ticker.
+        Returns True if an exit trade/error row was recorded (to avoid entry+exit churn same tick).
+        """
+        should_exit, exit_reasons = self._should_exit_on_thesis_deterioration(
+            chosen=chosen,
+            sig=sig,
+            final_conviction=final_conviction,
+            news=news,
+            news_applied=news_applied,
+        )
+        if not should_exit:
+            return False
+
+        pos = self._find_open_position_for_ticker(str(chosen.get("ticker")))
+        if not pos:
+            return False
+
+        exit_order = self._build_conservative_exit_order(chosen, pos)
+        if not exit_order:
+            self.logger.info(f"EXIT skip {chosen['ticker']} | could not build exit order from position payload")
+            return False
+
+        exit_action = f"TRADE_EXIT_{exit_order['held_side']}"
+        reasons = list(getattr(sig, "reasons", [])) + [
+            f"social:{','.join(getattr(social, 'reasons', []))}",
+            "risk:exit_thesis_deterioration",
+            f"news:{news.get('regime', 'unavailable')}",
+            f"news_score_raw:{float(news.get('score', 0.0)):.2f}",
+            f"news_score_eff:{float(news_applied.get('effective_news_score', 0.0)):.2f}",
+            f"news_conf:{float(news.get('confidence', 0.0)):.2f}",
+            f"entry_price_cents:{int(exit_order['price_cents'])}",
+            f"exit_order_side:{exit_order['side']}",
+            f"exit_yes_no:{exit_order['yes_no']}",
+            f"exit_count:{int(exit_order['count'])}",
+        ] + exit_reasons
+
+        action = "SKIP"
+        try:
+            self.client.place_order(
+                ticker=exit_order["ticker"],
+                side=exit_order["side"],
+                yes_no=exit_order["yes_no"],
+                count=exit_order["count"],
+                price_cents=exit_order["price_cents"],
+                client_order_id=exit_order["client_order_id"],
+            )
+            action = exit_action
+            self.logger.info(
+                f"{exit_action} {chosen['ticker']} count={exit_order['count']} "
+                f"price={exit_order['price_cents']}c dry_run={self.settings.DRY_RUN}"
+            )
+            self.notifier.send(
+                f"📉 {exit_action} `{chosen['ticker']}` | count={exit_order['count']} | px={exit_order['price_cents']}c "
+                f"| conv={final_conviction:.1f} | news_eff={float(news_applied.get('effective_news_score', 0.0)):.1f} "
+                f"| dry_run={self.settings.DRY_RUN}"
+            )
+        except KalshiAPIError as e:
+            action = "ERROR"
+            self.logger.exception(f"Exit order error: {e}")
+            self.notifier.send(f"⚠️ Kalshi exit order error: {e}")
+
+        row = {
+            "ts": now,
+            "ticker": chosen["ticker"],
+            "direction": str(getattr(sig, "direction", "SKIP")),
+            "base_conviction": float(getattr(sig, "conviction_score", 0.0)),
+            "social_bonus": float(getattr(social, "bonus_score", 0.0)),
+            "final_conviction": float(final_conviction),
+            "stake_dollars": 0.0,  # exits tracked by contract count; keep stake neutral for PnL stats compatibility
+            "action": action,
+            "reasons": ";".join(reasons),
+            "dry_run": self.settings.DRY_RUN,
+            "realized_pnl": None,
+            "won": None,
+            "resolved_ts": None,
+            "market_category": chosen.get("category"),
+            "news_score": float(news.get("score", 0.0)),
+            "news_confidence": float(news.get("confidence", 0.0)),
+            "news_regime": str(news.get("regime", "unavailable")),
+            "news_effective_score": float(news_applied.get("effective_news_score", 0.0)),
+            "spread_cents": chosen.get("spread_cents"),
+        }
+        self._record_decision_row(row)
+        return True
 
     def _fetch_market_universe(self, pages: int = 5, page_limit: int = 100) -> list[dict]:
         """
@@ -788,6 +1251,28 @@ class BotApp:
 
         snapshot = self._fetch_portfolio_snapshot()
 
+        # -----------------------------
+        # NEW: Conservative thesis-deterioration exit management
+        # Only applies if an open position exists in the chosen ticker.
+        # -----------------------------
+        try:
+            exited = self._maybe_manage_exit_for_chosen(
+                now=now,
+                chosen=chosen,
+                sig=sig,
+                social=social,
+                news=news,
+                news_applied=news_applied,
+                final_conviction=final_conviction,
+            )
+            if exited:
+                # refresh snapshot post-exit attempt for summaries/alerts
+                snapshot = self._fetch_portfolio_snapshot()
+                self._post_tick_housekeeping(snapshot)
+                return
+        except Exception as e:
+            self.logger.warning(f"Exit-management check failed (continuing to entry logic): {e}")
+
         social_size_boost = 0.0
         if sig.direction != "SKIP" and social.bonus_score > 0:
             social_size_boost = min(self.settings.SOCIAL_SIZE_BOOST_MAX_PCT, social.bonus_score / 100.0)
@@ -826,7 +1311,6 @@ class BotApp:
         )
 
         action = "SKIP"
-        order_resp = None
         reasons = sig.reasons + [
             f"social:{','.join(social.reasons)}",
             f"risk:{risk.reason}",
@@ -857,7 +1341,7 @@ class BotApp:
                 pass
 
             try:
-                order_resp = self.client.place_order(
+                self.client.place_order(
                     ticker=order["ticker"],
                     side=order["side"],
                     yes_no=order["yes_no"],
@@ -913,77 +1397,11 @@ class BotApp:
             "spread_cents": chosen.get("spread_cents"),
         }
 
-        inserted_id: Optional[int] = None
-        try:
-            inserted_id = self.store.insert_decision(row)
-        except TypeError:
-            # Backward compatibility if older StateStore insert signature ignores new fields poorly
-            legacy_row = {
-                "ts": row["ts"],
-                "ticker": row["ticker"],
-                "direction": row["direction"],
-                "base_conviction": row["base_conviction"],
-                "social_bonus": row["social_bonus"],
-                "final_conviction": row["final_conviction"],
-                "stake_dollars": row["stake_dollars"],
-                "action": row["action"],
-                "reasons": row["reasons"],
-                "dry_run": row["dry_run"],
-                "realized_pnl": row["realized_pnl"],
-                "won": row["won"],
-                "resolved_ts": row["resolved_ts"],
-                "market_category": row["market_category"],
-            }
-            inserted_id = self.store.insert_decision(legacy_row)
+        self._record_decision_row(row)
+        self._post_tick_housekeeping(snapshot)
 
-            # Best-effort patch for newer metadata if running against a partially-upgraded store
-            try:
-                if hasattr(self.store, "update_decision_metadata") and inserted_id is not None:
-                    self.store.update_decision_metadata(
-                        decision_id=int(inserted_id),
-                        updates={
-                            "news_score": row["news_score"],
-                            "news_confidence": row["news_confidence"],
-                            "news_regime": row["news_regime"],
-                            "news_effective_score": row["news_effective_score"],
-                            "spread_cents": row["spread_cents"],
-                        },
-                    )
-            except Exception as e:
-                self.logger.warning(f"Post-insert metadata patch failed (safe to ignore): {e}")
-
-        if self.settings.DRY_RUN and self.paper_resolver_enabled:
-            try:
-                rr = resolve_paper_trades(
-                    store=self.store,
-                    client=self.client,
-                    logger=self.logger,
-                    max_to_check=self.paper_resolver_max_to_check,
-                    min_age_minutes=self.paper_resolver_min_age_minutes,
-                )
-                if rr.updated > 0:
-                    self.logger.info(
-                        f"Paper resolver updated={rr.updated} checked={rr.checked} skipped={rr.skipped}"
-                    )
-            except Exception as e:
-                self.logger.warning(f"Paper resolver failed: {e}")
-
-        recent20 = self.store.recent_decisions(20)
-        summary = summarize_decisions(recent20)
-        self.logger.info(f"Recent summary: {summary}")
-
-        recent50 = self.store.recent_decisions(50)
-        mode_stats = self._mode_stats_from_decisions(recent50)
-        self.logger.info(f"Mode stats (50): {mode_stats}")
-
-        self._maybe_send_periodic_summary(snapshot, recent50)
-        self._maybe_send_scorecard_summary()
-
-        if snapshot.cash_balance_dollars >= self.settings.WITHDRAWAL_ALERT_THRESHOLD_DOLLARS:
-            self.notifier.send(
-                f"💸 Cash balance appears >= ${self.settings.WITHDRAWAL_ALERT_THRESHOLD_DOLLARS:.0f}. "
-                f"Consider manual withdrawal via Kalshi UI."
-            )
+    def main(self) -> None:
+        raise NotImplementedError("Use module-level main().")
 
 
 def main() -> None:

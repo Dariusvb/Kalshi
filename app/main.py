@@ -3,7 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import signal
 import sys
-from typing import Any
+from typing import Any, Optional
 
 from app.config import Settings
 from app.discord_notifier import DiscordNotifier
@@ -49,6 +49,10 @@ class BotApp:
         self.paper_resolver_enabled = True
         self.paper_resolver_min_age_minutes = 15
         self.paper_resolver_max_to_check = 25
+
+        # Risk-on suppression inputs (not trade blocking)
+        self.min_resolved_for_winrate_gate = 6           # require some sample size
+        self.min_winrate_for_risk_on_gate = 0.48         # slightly looser than 0.50 so it isn't too timid
 
     def shutdown(self) -> None:
         self._stopping = True
@@ -195,6 +199,43 @@ class BotApp:
             "live": summarize_mode(live_rows),
         }
 
+    def _compute_recent_winrate_for_risk_gate(
+        self,
+        decisions: list[dict],
+        *,
+        use_dry_run_mode: bool,
+        lookback_resolved: int = 12,
+    ) -> tuple[Optional[float], int]:
+        """
+        Compute recent win rate for risk-on gating only (not trade blocking).
+        Returns (win_rate_0_to_1_or_None, resolved_classified_count)
+
+        Uses only resolved TRADE_* rows in the same mode (dry_run vs live).
+        If sample size is too small, returns None so risk engine won't suppress risk-on.
+        """
+        mode_rows = [d for d in decisions if bool(d.get("dry_run", True)) == bool(use_dry_run_mode)]
+        resolved_trades = [
+            d for d in mode_rows
+            if str(d.get("action", "")).startswith("TRADE") and d.get("resolved_ts") is not None
+        ]
+
+        wins = 0
+        losses = 0
+        counted = 0
+        for d in resolved_trades[:lookback_resolved]:
+            w = d.get("won")
+            if w is True or w == 1:
+                wins += 1
+                counted += 1
+            elif w is False or w == 0:
+                losses += 1
+                counted += 1
+
+        if counted < self.min_resolved_for_winrate_gate:
+            return None, counted
+
+        return (wins / counted) if counted > 0 else None, counted
+
     def _maybe_send_periodic_summary(self, snapshot: PortfolioSnapshot, recent: list[dict]) -> None:
         """
         Sends a lightweight Discord summary approximately every 10 ticks.
@@ -246,7 +287,7 @@ class BotApp:
             self.logger.info("No candidate market found.")
             # still emit periodic summary even on no-candidate ticks
             snapshot = self._fetch_portfolio_snapshot()
-            recent = self.store.recent_decisions(50)
+            recent = self.store.recent_decisions(80)
             self._maybe_send_periodic_summary(snapshot, recent)
             return
 
@@ -255,8 +296,8 @@ class BotApp:
             f"| spread={chosen['spread_cents']} | vol={chosen['volume']}"
         )
 
-        # recent history for adaptive logic (works in DRY_RUN; becomes real learning once outcomes are logged)
-        recent_for_learning = self.store.recent_decisions(30)
+        # Use a larger window so outcome-aware learning has enough resolved trades
+        recent_for_learning = self.store.recent_decisions(80)
         learning = self._compute_learning(recent_for_learning)
 
         self.logger.info(
@@ -290,6 +331,23 @@ class BotApp:
         if sig.direction != "SKIP" and social.bonus_score > 0:
             social_size_boost = min(self.settings.SOCIAL_SIZE_BOOST_MAX_PCT, social.bonus_score / 100.0)
 
+        # Risk-on suppression gate (NOT trade blocking)
+        recent_win_rate_for_gate, winrate_sample = self._compute_recent_winrate_for_risk_gate(
+            recent_for_learning,
+            use_dry_run_mode=self.settings.DRY_RUN,
+            lookback_resolved=12,
+        )
+
+        if recent_win_rate_for_gate is None:
+            self.logger.info(
+                f"Risk-on gate: inactive (resolved sample too small: {winrate_sample}/{self.min_resolved_for_winrate_gate})"
+            )
+        else:
+            self.logger.info(
+                f"Risk-on gate: recent_wr={recent_win_rate_for_gate:.2%} sample={winrate_sample} "
+                f"threshold={self.min_winrate_for_risk_on_gate:.2%}"
+            )
+
         risk = evaluate_risk(
             conviction=final_conviction,
             current_open_exposure=snapshot.open_exposure_dollars,
@@ -301,7 +359,9 @@ class BotApp:
             max_open_exposure_dollars=self.settings.MAX_OPEN_EXPOSURE_DOLLARS,
             max_simultaneous_positions=self.settings.MAX_SIMULTANEOUS_POSITIONS,
             social_size_boost_pct=social_size_boost,
-            learning_multiplier=float(learning["stake_multiplier"]),  # requires updated risk_engine.py
+            learning_multiplier=float(learning["stake_multiplier"]),  # updated risk_engine.py supports this
+            recent_win_rate=recent_win_rate_for_gate,                 # only suppresses risk-on sizing if weak
+            min_win_rate_for_risk_on=self.min_winrate_for_risk_on_gate,
         )
 
         action = "SKIP"
@@ -311,6 +371,10 @@ class BotApp:
             f"risk:{risk.reason}",
             f"learning_mode:{learning['mode']}",
         ]
+
+        if recent_win_rate_for_gate is not None:
+            reasons.append(f"risk_gate_wr:{recent_win_rate_for_gate:.3f}")
+            reasons.append(f"risk_gate_wr_n:{winrate_sample}")
 
         if sig.direction != "SKIP" and risk.allowed:
             order = build_limit_order_from_signal(chosen["ticker"], sig.direction, chosen, risk.stake_dollars)
@@ -340,6 +404,7 @@ class BotApp:
                     f"📈 {action} `{chosen['ticker']}` | stake=${risk.stake_dollars:.2f} "
                     f"| conv={final_conviction:.1f} (base {sig.conviction_score:.1f} + social {social.bonus_score:.1f}) "
                     f"| learning={learning['mode']} x{float(learning['stake_multiplier']):.2f} "
+                    f"| gate_wr={('n/a' if recent_win_rate_for_gate is None else f'{recent_win_rate_for_gate*100:.1f}%')} "
                     f"| dry_run={self.settings.DRY_RUN}"
                 )
 
@@ -370,7 +435,7 @@ class BotApp:
             "resolved_ts": None,
             "market_category": chosen.get("category"),
         }
-        inserted_id = self.store.insert_decision(row)
+        _inserted_id = self.store.insert_decision(row)
 
         # Resolve older DRY_RUN trades into paper outcomes so summaries/learning can use W/L + PnL
         if self.settings.DRY_RUN and self.paper_resolver_enabled:
@@ -390,15 +455,16 @@ class BotApp:
                 self.logger.warning(f"Paper resolver failed: {e}")
 
         # local logs
-        recent = self.store.recent_decisions(20)
-        summary = summarize_decisions(recent)
+        recent20 = self.store.recent_decisions(20)
+        summary = summarize_decisions(recent20)
         self.logger.info(f"Recent summary: {summary}")
 
-        mode_stats = self._mode_stats_from_decisions(self.store.recent_decisions(50))
+        recent50 = self.store.recent_decisions(50)
+        mode_stats = self._mode_stats_from_decisions(recent50)
         self.logger.info(f"Mode stats (50): {mode_stats}")
 
         # periodic Discord summary
-        self._maybe_send_periodic_summary(snapshot, self.store.recent_decisions(50))
+        self._maybe_send_periodic_summary(snapshot, recent50)
 
         # withdrawal alert (notification-only)
         if snapshot.cash_balance_dollars >= self.settings.WITHDRAWAL_ALERT_THRESHOLD_DOLLARS:

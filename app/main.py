@@ -305,26 +305,108 @@ class BotApp:
         return []
 
     def _choose_market(self, markets: list[dict]) -> Any:
-        candidates = []
+        """
+        Choose the best market summary from the fetched universe.
+
+        Strategy:
+        1) strict path (existing behavior)
+        2) relaxed fallback path for MVE/one-sided quote conditions
+           - still requires valid status + some quote signal
+           - applies an effective spread penalty to low-quality quotes
+        """
+        ok_status = {"active", "open", "trading", "unknown"}
+
+        # --- Strict path (original behavior) ---
+        strict_candidates: list[dict] = []
         for m in markets[:200]:
-            s = summarize_market(m)
-
-            if s["status"].lower() not in {"active", "open", "trading", "unknown"}:
+            try:
+                s = summarize_market(m)
+            except Exception:
                 continue
 
-            if s["spread_cents"] <= 0 or s["spread_cents"] > self.settings.MAX_SPREAD_CENTS:
-                continue
-            if s["volume"] < self.settings.MIN_RECENT_VOLUME:
+            if str(s.get("status", "")).lower() not in ok_status:
                 continue
 
-            mid = s["mid_yes_cents"]
+            spread = float(s.get("spread_cents", 0) or 0)
+            volume = float(s.get("volume", 0) or 0)
+            mid = float(s.get("mid_yes_cents", 0) or 0)
+
+            if spread <= 0 or spread > float(self.settings.MAX_SPREAD_CENTS):
+                continue
+            if volume < float(self.settings.MIN_RECENT_VOLUME):
+                continue
             if mid <= 2 or mid >= 98:
                 continue
 
-            candidates.append(s)
+            s["_pick_mode"] = "strict"
+            s["_effective_spread"] = spread
+            strict_candidates.append(s)
 
-        candidates.sort(key=lambda x: (x["spread_cents"], abs(x["mid_yes_cents"] - 50), -x["volume"]))
-        return candidates[0] if candidates else None
+        strict_candidates.sort(
+            key=lambda x: (
+                x.get("_effective_spread", 999),
+                abs((x.get("mid_yes_cents", 50) or 50) - 50),
+                -(x.get("volume", 0) or 0),
+            )
+        )
+        if strict_candidates:
+            return strict_candidates[0]
+
+        # --- Relaxed fallback path ---
+        relaxed_candidates: list[dict] = []
+        max_relaxed_spread = max(
+            float(self.settings.MAX_SPREAD_CENTS) * 2.0,
+            float(self.settings.MAX_SPREAD_CENTS) + 5.0,
+        )
+
+        for m in markets[:200]:
+            try:
+                s = summarize_market(m)
+            except Exception:
+                continue
+
+            if str(s.get("status", "")).lower() not in ok_status:
+                continue
+
+            spread = float(s.get("spread_cents", 0) or 0)
+            mid = float(s.get("mid_yes_cents", 0) or 0)
+            volume = float(s.get("volume", 0) or 0)
+            yes_bid = float(s.get("yes_bid", 0) or 0)
+            yes_ask = float(s.get("yes_ask", 0) or 0)
+
+            # Require at least some quote signal
+            if yes_bid <= 0 and yes_ask <= 0 and mid <= 0:
+                continue
+
+            # Avoid extreme tails / broken quotes
+            if mid and (mid <= 1 or mid >= 99):
+                continue
+
+            # Use reported spread if usable; otherwise infer; otherwise heavily penalize one-sided quotes
+            if spread > 0:
+                effective_spread = spread
+            elif yes_bid > 0 and yes_ask > 0 and yes_ask >= yes_bid:
+                effective_spread = yes_ask - yes_bid
+            else:
+                effective_spread = 99.0  # one-sided quote penalty
+
+            if effective_spread > max_relaxed_spread:
+                continue
+
+            s["_pick_mode"] = "relaxed"
+            s["_effective_spread"] = effective_spread
+            s["_relaxed"] = True
+            s["_volume_for_sort"] = volume
+            relaxed_candidates.append(s)
+
+        relaxed_candidates.sort(
+            key=lambda x: (
+                x.get("_effective_spread", 999),
+                abs((x.get("mid_yes_cents", 50) or 50) - 50),
+                -(x.get("_volume_for_sort", 0) or 0),
+            )
+        )
+        return relaxed_candidates[0] if relaxed_candidates else None
 
     def _compute_learning(self, recent: list[dict]) -> dict:
         if compute_learning_adjustment is None:

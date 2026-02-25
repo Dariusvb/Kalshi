@@ -150,6 +150,11 @@ class BotApp:
         preferred_non_mve: list[dict] = []
         mve_fallback_candidates: list[dict] = []
 
+        # Stricter fallback quality floor to avoid ask-only / phantom MVE quotes
+        fallback_min_mid = 5.0
+        fallback_max_mid = 95.0
+        fallback_min_volume = max(1.0, float(self.settings.MIN_RECENT_VOLUME))
+
         for _ in range(max(1, int(pages))):
             try:
                 # Preferred path (patched client supports cursor)
@@ -189,14 +194,18 @@ class BotApp:
                 spread = float(s.get("spread_cents", 0) or 0)
                 mid = float(s.get("mid_yes_cents", 0) or 0)
                 vol = float(s.get("volume", 0) or 0)
+                yes_bid = float(s.get("yes_bid", 0) or 0)
+                yes_ask = float(s.get("yes_ask", 0) or 0)
 
+                # Fallback should be stricter than normal candidate filter because MVE feed can be noisy.
                 quote_ok_for_fallback = (
                     status_ok
                     and spread > 0
                     and spread <= int(self.settings.MAX_SPREAD_CENTS)
-                    and mid > 2
-                    and mid < 98
-                    and vol >= float(self.settings.MIN_RECENT_VOLUME)
+                    and fallback_min_mid <= mid <= fallback_max_mid
+                    and yes_bid > 0
+                    and yes_ask > 0
+                    and vol >= fallback_min_volume
                 )
 
                 if is_mve:
@@ -250,13 +259,18 @@ class BotApp:
 
             self.logger.warning(
                 "Universe fetch fallback ACTIVE | seen=%s kept_non_mve=0 dropped_mve=%s dropped_provisional=%s "
-                "dupes=%s mve_fallback_kept=%s pages=%s",
+                "dupes=%s mve_fallback_kept=%s pages=%s "
+                "| fallback_rules: bid>0 ask>0 mid=[%.1f,%.1f] vol>=%.1f spread<=%s",
                 total_seen,
                 dropped_mve,
                 dropped_provisional,
                 duplicate_tickers,
                 len(fallback_markets),
                 pages_fetched,
+                fallback_min_mid,
+                fallback_max_mid,
+                fallback_min_volume,
+                int(self.settings.MAX_SPREAD_CENTS),
             )
             return fallback_markets
 

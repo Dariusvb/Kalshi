@@ -131,7 +131,7 @@ class BotApp:
         Fetch multiple pages of markets and build a tradeable universe before _choose_market() ranking.
 
         Preference order:
-        1) non-MVE + non-provisional (best fit for current strategy)
+        1) non-MVE + non-provisional + quote-usable (best fit for current strategy)
         2) if none exist in fetched pages, fall back to quote-quality-filtered MVE markets
 
         Notes:
@@ -145,15 +145,17 @@ class BotApp:
         dropped_mve = 0
         dropped_provisional = 0
         duplicate_tickers = 0
+        dropped_preferred_quote = 0
 
         seen_tickers: set[str] = set()
         preferred_non_mve: list[dict] = []
         mve_fallback_candidates: list[dict] = []
 
-        # Stricter fallback quality floor to avoid ask-only / phantom MVE quotes
-        fallback_min_mid = 5.0
-        fallback_max_mid = 95.0
-        fallback_min_volume = max(1.0, float(self.settings.MIN_RECENT_VOLUME))
+        # Relaxed-but-not-crazy fallback thresholds for MVE-dominated feeds
+        fallback_min_mid = 3.0
+        fallback_max_mid = 97.0
+        fallback_min_volume = 0.0  # allow fresh markets
+        fallback_require_at_least_one_side = True  # bid>0 OR ask>0
 
         for _ in range(max(1, int(pages))):
             try:
@@ -197,20 +199,30 @@ class BotApp:
                 yes_bid = float(s.get("yes_bid", 0) or 0)
                 yes_ask = float(s.get("yes_ask", 0) or 0)
 
-                # Fallback should be stricter than normal candidate filter because MVE feed can be noisy.
-                quote_ok_for_fallback = (
+                # Standard preferred gate (matches chooser behavior)
+                quote_ok_standard = (
+                    status_ok
+                    and spread > 0
+                    and spread <= int(self.settings.MAX_SPREAD_CENTS)
+                    and mid > 2
+                    and mid < 98
+                    and vol >= float(self.settings.MIN_RECENT_VOLUME)
+                )
+
+                # Relaxed MVE fallback gate for current feed conditions
+                one_side_ok = (yes_bid > 0 or yes_ask > 0) if fallback_require_at_least_one_side else True
+                quote_ok_for_mve_fallback = (
                     status_ok
                     and spread > 0
                     and spread <= int(self.settings.MAX_SPREAD_CENTS)
                     and fallback_min_mid <= mid <= fallback_max_mid
-                    and yes_bid > 0
-                    and yes_ask > 0
+                    and one_side_ok
                     and vol >= fallback_min_volume
                 )
 
                 if is_mve:
                     dropped_mve += 1
-                    if quote_ok_for_fallback:
+                    if quote_ok_for_mve_fallback:
                         mve_fallback_candidates.append(m)
                     continue
 
@@ -218,7 +230,10 @@ class BotApp:
                     dropped_provisional += 1
                     continue
 
-                preferred_non_mve.append(m)
+                if quote_ok_standard:
+                    preferred_non_mve.append(m)
+                else:
+                    dropped_preferred_quote += 1
 
             # Stop if no pagination cursor exists (or raw isn't dict-like)
             if not isinstance(raw, dict):
@@ -233,12 +248,13 @@ class BotApp:
 
         if preferred_non_mve:
             self.logger.info(
-                "Universe fetch | seen=%s kept=%s dropped_mve=%s dropped_provisional=%s dupes=%s "
-                "fallback_mve_candidates=%s pages=%s",
+                "Universe fetch | seen=%s kept=%s dropped_mve=%s dropped_provisional=%s "
+                "dropped_preferred_quote=%s dupes=%s fallback_mve_candidates=%s pages=%s",
                 total_seen,
                 len(preferred_non_mve),
                 dropped_mve,
                 dropped_provisional,
+                dropped_preferred_quote,
                 duplicate_tickers,
                 len(mve_fallback_candidates),
                 pages_fetched,
@@ -259,14 +275,16 @@ class BotApp:
 
             self.logger.warning(
                 "Universe fetch fallback ACTIVE | seen=%s kept_non_mve=0 dropped_mve=%s dropped_provisional=%s "
-                "dupes=%s mve_fallback_kept=%s pages=%s "
-                "| fallback_rules: bid>0 ask>0 mid=[%.1f,%.1f] vol>=%.1f spread<=%s",
+                "dropped_preferred_quote=%s dupes=%s mve_fallback_kept=%s pages=%s "
+                "| fallback_rules: one_side=%s mid=[%.1f,%.1f] vol>=%.1f spread<=%s",
                 total_seen,
                 dropped_mve,
                 dropped_provisional,
+                dropped_preferred_quote,
                 duplicate_tickers,
                 len(fallback_markets),
                 pages_fetched,
+                fallback_require_at_least_one_side,
                 fallback_min_mid,
                 fallback_max_mid,
                 fallback_min_volume,
@@ -275,11 +293,12 @@ class BotApp:
             return fallback_markets
 
         self.logger.warning(
-            "Universe fetch | seen=%s kept=0 dropped_mve=%s dropped_provisional=%s dupes=%s "
-            "mve_fallback_kept=0 pages=%s",
+            "Universe fetch | seen=%s kept=0 dropped_mve=%s dropped_provisional=%s "
+            "dropped_preferred_quote=%s dupes=%s mve_fallback_kept=0 pages=%s",
             total_seen,
             dropped_mve,
             dropped_provisional,
+            dropped_preferred_quote,
             duplicate_tickers,
             pages_fetched,
         )

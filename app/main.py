@@ -332,8 +332,6 @@ class BotApp:
         news_regime = str(news.get("regime", "unavailable"))
         sig_dir = str(base_signal_direction or "SKIP").upper()
 
-        # No directional trade -> still compute for logging, but don't force action logic
-        # (it only affects final conviction if a trade signal already exists downstream)
         # Confidence scaling with floor
         if news_conf <= self.news_min_confidence_to_apply:
             conf_scale = 0.10  # tiny effect, not zero (useful for logging/experiments)
@@ -351,7 +349,6 @@ class BotApp:
             regime_scale = self.news_mixed_regime_multiplier
 
         # Directional compatibility check (raw news score >0 implies YES-ish; <0 implies NO-ish)
-        # If signal is YES and news is negative (or vice versa), dampen heavily.
         conflict = False
         if sig_dir == "YES" and raw_news_score < 0:
             conflict = True
@@ -647,8 +644,9 @@ class BotApp:
             "spread_cents": chosen.get("spread_cents"),
         }
 
+        inserted_id: Optional[int] = None
         try:
-            _inserted_id = self.store.insert_decision(row)
+            inserted_id = self.store.insert_decision(row)
         except TypeError:
             # Backward compatibility if older StateStore insert signature ignores new fields poorly
             legacy_row = {
@@ -667,7 +665,23 @@ class BotApp:
                 "resolved_ts": row["resolved_ts"],
                 "market_category": row["market_category"],
             }
-            _inserted_id = self.store.insert_decision(legacy_row)
+            inserted_id = self.store.insert_decision(legacy_row)
+
+            # Best-effort patch for newer metadata if running against a partially-upgraded store
+            try:
+                if hasattr(self.store, "update_decision_metadata") and inserted_id is not None:
+                    self.store.update_decision_metadata(
+                        decision_id=int(inserted_id),
+                        updates={
+                            "news_score": row["news_score"],
+                            "news_confidence": row["news_confidence"],
+                            "news_regime": row["news_regime"],
+                            "news_effective_score": row["news_effective_score"],
+                            "spread_cents": row["spread_cents"],
+                        },
+                    )
+            except Exception as e:
+                self.logger.warning(f"Post-insert metadata patch failed (safe to ignore): {e}")
 
         if self.settings.DRY_RUN and self.paper_resolver_enabled:
             try:

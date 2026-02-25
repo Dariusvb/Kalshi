@@ -86,6 +86,7 @@ def evaluate_risk(
     max_category_exposure_dollars: float | None = None,
     recent_win_rate: float | None = None,           # 0.0 to 1.0, if available
     min_win_rate_for_risk_on: float = 0.50,         # risk-on only if rolling win rate >= this
+    available_cash_dollars: float | None = None,    # optional cash gate for live safety
 ) -> RiskDecision:
     """
     Central risk gate.
@@ -94,6 +95,7 @@ def evaluate_risk(
     - daily loss cap
     - max simultaneous positions
     - max open exposure
+    - optional available cash check
 
     Future-ready soft/optional stops:
     - drawdown lockout
@@ -117,6 +119,10 @@ def evaluate_risk(
     if int(open_positions_count) >= int(max_simultaneous_positions):
         return RiskDecision(False, 0.0, "max_positions_hit")
 
+    # Optional early cash guard (useful in live mode to avoid futile order attempts)
+    if available_cash_dollars is not None and float(available_cash_dollars) < float(min_dollars):
+        return RiskDecision(False, 0.0, "insufficient_cash_min_trade")
+
     # Determine whether learning/social risk-on is allowed
     allow_risk_on_sizing = True
     if recent_win_rate is not None and recent_win_rate < float(min_win_rate_for_risk_on):
@@ -133,6 +139,10 @@ def evaluate_risk(
         recent_win_rate=recent_win_rate,
         min_win_rate_for_risk_on=min_win_rate_for_risk_on,
     )
+
+    # Optional cash gate (prevents placing an order bigger than available cash)
+    if available_cash_dollars is not None and float(available_cash_dollars) < float(stake):
+        return RiskDecision(False, 0.0, "insufficient_cash")
 
     # ---- Exposure caps ----
     if float(current_open_exposure) + float(stake) > float(max_open_exposure_dollars):

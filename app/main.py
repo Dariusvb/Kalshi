@@ -628,7 +628,7 @@ class BotApp:
             "base_conviction": sig.conviction_score,
             "social_bonus": social.bonus_score,
             "final_conviction": final_conviction,
-            "stake_dollars": risk.stake_dollars if risk.allowed else 0.0,
+            "stake_dollars": risk.stake_dollars if action.startswith("TRADE_") else 0.0,
             "action": action,
             "reasons": ";".join(reasons),
             "dry_run": self.settings.DRY_RUN,

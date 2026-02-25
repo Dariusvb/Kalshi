@@ -1155,13 +1155,106 @@ class BotApp:
     # News / scorecard helpers
     # -----------------------------
     def _news_category_allowlist(self) -> list[str]:
+        # Keep this conservative; you can widen later once you trust query quality.
         return ["politics", "weather", "sports", "macro"]
 
     def _fetch_news_items_for_market(self, chosen: dict) -> list[dict]:
         """
-        Placeholder adapter for future real news integration.
+        Real news adapter:
+        - builds query from market label/title/question
+        - fetches items via app/news_fetch.py
+        - (optional) uses app/news_cache.py if present
+        - infers direction_hint + strength so evaluate_news_signal() can work
         """
-        return []
+        # ---- Import news_fetch (required for this path) ----
+        try:
+            from app.news_fetch import (
+                build_news_query_from_market_label,
+                fetch_google_news_rss,
+                infer_direction_hint,
+                yes_means_event_occurs,
+            )
+        except Exception as e:
+            if self.logger:
+                self.logger.warning(f"News fetch module unavailable: {e}")
+            return []
+
+        # ---- Optional cache adapter (best-effort; safe if missing) ----
+        cache_get = None
+        cache_set = None
+        try:
+            # Support a few common function names without forcing your cache API.
+            import app.news_cache as nc  # type: ignore
+
+            cache_get = getattr(nc, "get_cached_news_items", None) or getattr(nc, "cache_get", None)
+            cache_set = getattr(nc, "set_cached_news_items", None) or getattr(nc, "cache_set", None)
+        except Exception:
+            cache_get = None
+            cache_set = None
+
+        # ---- Choose the best label we have ----
+        label = str(
+            chosen.get("market_label")
+            or chosen.get("title")
+            or chosen.get("question")
+            or chosen.get("name")
+            or ""
+        ).strip()
+
+        if not label:
+            # last resort: ticker-based query (usually weak)
+            label = str(chosen.get("ticker") or "").strip()
+
+        if not label:
+            return []
+
+        # ---- Build query ----
+        query = build_news_query_from_market_label(label)
+        if not query:
+            return []
+
+        # ---- Cache lookup ----
+        cached: list[dict] = []
+        if callable(cache_get):
+            try:
+                # allow either cache_get(key) or cache_get(key, ttl_seconds=?)
+                try:
+                    cached = cache_get(query)  # type: ignore[misc]
+                except TypeError:
+                    cached = cache_get(query, 120)  # type: ignore[misc]
+                if isinstance(cached, list) and cached:
+                    return cached
+            except Exception as e:
+                if self.logger:
+                    self.logger.warning(f"News cache get failed (continuing): {e}")
+
+        # ---- Fetch RSS ----
+        items = fetch_google_news_rss(query, max_items=12, timeout=6.0)
+        if not items:
+            return []
+
+        # ---- Infer YES/NO meaning from wording & add direction_hint/strength ----
+        y_is_event = yes_means_event_occurs(label)
+        out: list[dict] = []
+        for it in items:
+            try:
+                out.append(infer_direction_hint(it, yes_means_event_occurs=y_is_event))
+            except Exception:
+                out.append(it)
+
+        # ---- Cache store ----
+        if callable(cache_set):
+            try:
+                # allow either cache_set(key, items) or cache_set(key, items, ttl_seconds=?)
+                try:
+                    cache_set(query, out)  # type: ignore[misc]
+                except TypeError:
+                    cache_set(query, out, 120)  # type: ignore[misc]
+            except Exception as e:
+                if self.logger:
+                    self.logger.warning(f"News cache set failed (continuing): {e}")
+
+        return out
 
     def _compute_news_signal(self, chosen: dict) -> dict:
         if not self.news_signal_enabled or evaluate_news_signal is None:

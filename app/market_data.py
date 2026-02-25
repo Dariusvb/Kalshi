@@ -17,6 +17,57 @@ def extract_markets(raw: Any) -> List[dict]:
     return []
 
 
+def extract_market_label(raw: Any, max_len: int = 160) -> str:
+    """
+    Best-effort human-readable label for a market.
+    Kalshi payload fields vary by endpoint/version, so we try multiple keys.
+    """
+    if not isinstance(raw, dict):
+        return ""
+
+    candidates: List[Any] = [
+        raw.get("title"),
+        raw.get("question"),
+        raw.get("subtitle"),
+        raw.get("name"),
+        raw.get("market_title"),
+        raw.get("event_title"),
+        raw.get("display_name"),
+    ]
+
+    # Sometimes nested under "event"
+    ev = raw.get("event")
+    if isinstance(ev, dict):
+        candidates.extend(
+            [
+                ev.get("title"),
+                ev.get("name"),
+                ev.get("event_title"),
+                ev.get("display_name"),
+            ]
+        )
+
+    # Sometimes nested under "market" or "markets"
+    mk = raw.get("market")
+    if isinstance(mk, dict):
+        candidates.extend(
+            [
+                mk.get("title"),
+                mk.get("question"),
+                mk.get("subtitle"),
+                mk.get("name"),
+            ]
+        )
+
+    for c in candidates:
+        if isinstance(c, str):
+            s = c.strip()
+            if s:
+                return (s[: max_len - 1] + "…") if len(s) > max_len else s
+
+    return ""
+
+
 def summarize_market(m: Dict[str, Any]) -> Dict[str, Any]:
     """
     Best-effort normalized fields; Kalshi payload fields can evolve.
@@ -37,6 +88,10 @@ def summarize_market(m: Dict[str, Any]) -> Dict[str, Any]:
     spread = abs(int(yes_ask or 0) - int(yes_bid or 0))
     mid = ((int(yes_ask or 0) + int(yes_bid or 0)) / 2) if (yes_ask or yes_bid) else 0
 
+    market_label = extract_market_label(m)
+    if not market_label:
+        market_label = str(ticker)
+
     return {
         "ticker": str(ticker),
         "yes_bid": int(yes_bid or 0),
@@ -45,5 +100,6 @@ def summarize_market(m: Dict[str, Any]) -> Dict[str, Any]:
         "mid_yes_cents": float(mid),
         "volume": float(volume or 0),
         "status": str(status),
+        "market_label": market_label,
         "raw": m,
     }

@@ -47,7 +47,7 @@ def extract_market_label(raw: Any, max_len: int = 160) -> str:
             ]
         )
 
-    # Sometimes nested under "market" or "markets"
+    # Sometimes nested under "market"
     mk = raw.get("market")
     if isinstance(mk, dict):
         candidates.extend(

@@ -26,6 +26,19 @@ try:
 except Exception:
     compute_learning_adjustment = None  # type: ignore
 
+# Optional news/trend confirmation module (safe fallback)
+try:
+    from app.news_signal import evaluate_news_signal
+except Exception:
+    evaluate_news_signal = None  # type: ignore
+
+# Optional setup scorecard summary module (safe fallback)
+try:
+    from app.setup_scorecard import build_setup_scorecard, summarize_scorecard_for_discord
+except Exception:
+    build_setup_scorecard = None  # type: ignore
+    summarize_scorecard_for_discord = None  # type: ignore
+
 
 class BotApp:
     def __init__(self) -> None:
@@ -53,6 +66,14 @@ class BotApp:
         # Risk-on suppression inputs (not trade blocking)
         self.min_resolved_for_winrate_gate = 6           # require some sample size
         self.min_winrate_for_risk_on_gate = 0.48         # slightly looser than 0.50 so it isn't too timid
+
+        # News signal defaults (bounded, optional)
+        self.news_signal_enabled = True
+        self.news_max_abs_score = 8.0
+        self.news_require_two_credible_sources = True
+
+        # Scorecard cadence (every N ticks)
+        self.scorecard_summary_every_n_ticks = 30
 
     def shutdown(self) -> None:
         self._stopping = True
@@ -236,6 +257,126 @@ class BotApp:
 
         return (wins / counted) if counted > 0 else None, counted
 
+    # -----------------------------
+    # News / scorecard helpers
+    # -----------------------------
+    def _news_category_allowlist(self) -> list[str]:
+        """
+        Start narrow. Expand only after scorecard proves value.
+        """
+        return ["politics", "weather", "sports", "macro"]
+
+    def _fetch_news_items_for_market(self, chosen: dict) -> list[dict]:
+        """
+        Placeholder adapter for future real news integration.
+        Returns [] until you wire an actual provider.
+
+        Expected item schema (flexible, used by app.news_signal):
+        {
+            "title": str,
+            "url": str,
+            "source": str,
+            "domain": str,                  # optional if url provided
+            "published_at": ISO str,        # or published_ts
+            "direction_hint": "YES|NO|NEUTRAL",
+            "strength": float (0..1),
+            "official_confirmation": bool,  # optional
+            "secondary_confirmation": bool, # optional
+        }
+        """
+        # TODO: Wire to a real news collector/provider and map the category/ticker to relevant queries.
+        return []
+
+    def _compute_news_signal(self, chosen: dict) -> dict:
+        """
+        Safe wrapper around optional news_signal module. Always returns normalized dict.
+        """
+        if not self.news_signal_enabled or evaluate_news_signal is None:
+            return {
+                "score": 0.0,
+                "confidence": 0.0,
+                "regime": "disabled",
+                "reasons": ["news_disabled_or_module_missing"],
+                "risk_flags": [],
+                "n_items": 0,
+                "n_unique": 0,
+                "n_tier1": 0,
+                "n_tier2": 0,
+                "n_tier3": 0,
+            }
+
+        try:
+            news_items = self._fetch_news_items_for_market(chosen)
+        except Exception as e:
+            self.logger.warning(f"News fetch failed for {chosen.get('ticker')}: {e}")
+            news_items = []
+
+        try:
+            ns = evaluate_news_signal(
+                chosen,
+                news_items,
+                enabled=True,
+                max_abs_score=self.news_max_abs_score,
+                require_two_credible_sources_for_boost=self.news_require_two_credible_sources,
+                category_allowlist=self._news_category_allowlist(),
+            )
+            return {
+                "score": float(getattr(ns, "score", 0.0)),
+                "confidence": float(getattr(ns, "confidence", 0.0)),
+                "regime": str(getattr(ns, "regime", "unavailable")),
+                "reasons": list(getattr(ns, "reasons", [])),
+                "risk_flags": list(getattr(ns, "risk_flags", [])),
+                "n_items": int(getattr(ns, "n_items", 0)),
+                "n_unique": int(getattr(ns, "n_unique", 0)),
+                "n_tier1": int(getattr(ns, "n_tier1", 0)),
+                "n_tier2": int(getattr(ns, "n_tier2", 0)),
+                "n_tier3": int(getattr(ns, "n_tier3", 0)),
+            }
+        except Exception as e:
+            self.logger.warning(f"News signal evaluation failed; using neutral: {e}")
+            return {
+                "score": 0.0,
+                "confidence": 0.0,
+                "regime": "error_fallback",
+                "reasons": ["news_eval_error"],
+                "risk_flags": [],
+                "n_items": 0,
+                "n_unique": 0,
+                "n_tier1": 0,
+                "n_tier2": 0,
+                "n_tier3": 0,
+            }
+
+    def _extract_recent_setup_scorecard(self, lookback: int = 200) -> Optional[dict]:
+        if build_setup_scorecard is None:
+            return None
+        try:
+            decisions = self.store.recent_decisions(lookback)
+            return build_setup_scorecard(decisions)
+        except Exception as e:
+            self.logger.warning(f"Build setup scorecard failed: {e}")
+            return None
+
+    def _maybe_send_scorecard_summary(self) -> None:
+        """
+        Send less frequently than normal summaries to avoid spam.
+        """
+        if build_setup_scorecard is None or summarize_scorecard_for_discord is None:
+            return
+        if self.scorecard_summary_every_n_ticks <= 0:
+            return
+        if (self._tick_count % self.scorecard_summary_every_n_ticks) != 0:
+            return
+
+        try:
+            scorecard = self._extract_recent_setup_scorecard(250)
+            if not scorecard:
+                return
+            msg = summarize_scorecard_for_discord(scorecard, top_n=3)
+            self.notifier.send(msg)
+        except Exception as e:
+            self.logger.warning(f"Scorecard summary failed: {e}")
+
     def _maybe_send_periodic_summary(self, snapshot: PortfolioSnapshot, recent: list[dict]) -> None:
         """
         Sends a lightweight Discord summary approximately every 10 ticks.
@@ -289,6 +430,7 @@ class BotApp:
             snapshot = self._fetch_portfolio_snapshot()
             recent = self.store.recent_decisions(80)
             self._maybe_send_periodic_summary(snapshot, recent)
+            self._maybe_send_scorecard_summary()
             return
 
         self.logger.info(
@@ -322,7 +464,19 @@ class BotApp:
             enabled=self.settings.SOCIAL_SIGNAL_ENABLED,
             max_bonus=self.settings.SOCIAL_MAX_BONUS_SCORE,
         )
-        final_conviction = min(100.0, sig.conviction_score + social.bonus_score)
+
+        news = self._compute_news_signal(chosen)
+        self.logger.info(
+            f"News signal regime={news['regime']} score={news['score']:.2f} conf={news['confidence']:.2f} "
+            f"items={news['n_items']}/{news['n_unique']} t1={news['n_tier1']} t2={news['n_tier2']} t3={news['n_tier3']} "
+            f"reasons={news['reasons']} flags={news['risk_flags']}"
+        )
+
+        # Bounded additive conviction; news should not dominate core signal
+        final_conviction = min(
+            100.0,
+            max(0.0, sig.conviction_score + social.bonus_score + float(news["score"])),
+        )
 
         snapshot = self._fetch_portfolio_snapshot()
 
@@ -370,7 +524,13 @@ class BotApp:
             f"social:{','.join(social.reasons)}",
             f"risk:{risk.reason}",
             f"learning_mode:{learning['mode']}",
+            f"news:{news['regime']}",
+            f"news_score:{float(news['score']):.2f}",
+            f"news_conf:{float(news['confidence']):.2f}",
         ]
+
+        if news.get("risk_flags"):
+            reasons.append(f"news_flags:{','.join(news['risk_flags'])}")
 
         if recent_win_rate_for_gate is not None:
             reasons.append(f"risk_gate_wr:{recent_win_rate_for_gate:.3f}")
@@ -402,8 +562,9 @@ class BotApp:
 
                 self.notifier.send(
                     f"📈 {action} `{chosen['ticker']}` | stake=${risk.stake_dollars:.2f} "
-                    f"| conv={final_conviction:.1f} (base {sig.conviction_score:.1f} + social {social.bonus_score:.1f}) "
+                    f"| conv={final_conviction:.1f} (base {sig.conviction_score:.1f} + social {social.bonus_score:.1f} + news {float(news['score']):.1f}) "
                     f"| learning={learning['mode']} x{float(learning['stake_multiplier']):.2f} "
+                    f"| news={news['regime']} "
                     f"| gate_wr={('n/a' if recent_win_rate_for_gate is None else f'{recent_win_rate_for_gate*100:.1f}%')} "
                     f"| dry_run={self.settings.DRY_RUN}"
                 )
@@ -434,6 +595,10 @@ class BotApp:
             "won": None,
             "resolved_ts": None,
             "market_category": chosen.get("category"),
+            "news_score": float(news["score"]),
+            "news_confidence": float(news["confidence"]),
+            "news_regime": str(news["regime"]),
+            "spread_cents": chosen.get("spread_cents"),
         }
         _inserted_id = self.store.insert_decision(row)
 
@@ -463,8 +628,9 @@ class BotApp:
         mode_stats = self._mode_stats_from_decisions(recent50)
         self.logger.info(f"Mode stats (50): {mode_stats}")
 
-        # periodic Discord summary
+        # periodic Discord summary + scorecard
         self._maybe_send_periodic_summary(snapshot, recent50)
+        self._maybe_send_scorecard_summary()
 
         # withdrawal alert (notification-only)
         if snapshot.cash_balance_dollars >= self.settings.WITHDRAWAL_ALERT_THRESHOLD_DOLLARS:

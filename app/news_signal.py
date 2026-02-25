@@ -34,12 +34,26 @@ def _parse_dt(x: Any) -> Optional[dt.datetime]:
         return None
     if isinstance(x, dt.datetime):
         return x if x.tzinfo else x.replace(tzinfo=dt.timezone.utc)
+
     s = str(x).strip()
     if not s:
         return None
+
+    # 1) Try ISO-8601
     try:
-        s = s.replace("Z", "+00:00")
-        parsed = dt.datetime.fromisoformat(s)
+        s_iso = s.replace("Z", "+00:00")
+        parsed = dt.datetime.fromisoformat(s_iso)
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
+    except Exception:
+        pass
+
+    # 2) Try RFC822 / RSS pubDate (e.g., "Wed, 25 Feb 2026 18:52:00 GMT")
+    try:
+        from email.utils import parsedate_to_datetime
+
+        parsed = parsedate_to_datetime(s)
+        if parsed is None:
+            return None
         return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
     except Exception:
         return None

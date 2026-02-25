@@ -194,10 +194,17 @@ class KalshiClient:
     def list_fills(self, limit: int = 50) -> Any:
         return self._request("GET", "/trade-api/v2/portfolio/fills", params={"limit": limit})
 
-    def get_markets(self, limit: int = 100, status: Optional[str] = None) -> Any:
-        params: Dict[str, Any] = {"limit": limit}
+    def get_markets(
+        self,
+        limit: int = 100,
+        status: Optional[str] = None,
+        cursor: Optional[str] = None,
+    ) -> Any:
+        params: Dict[str, Any] = {"limit": int(limit)}
         if status:
             params["status"] = status
+        if cursor:
+            params["cursor"] = cursor
 
         # Try authenticated request first. If auth blocks or key is mispaired,
         # public fallback is helpful for smoke tests / debugging.

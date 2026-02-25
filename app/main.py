@@ -93,6 +93,13 @@ class BotApp:
         # Scorecard cadence (every N ticks)
         self.scorecard_summary_every_n_ticks = 30
 
+        # DRY_RUN-only pipeline validation knobs (safe defaults; live untouched)
+        self.pipeline_test_entries_enabled = True
+        self.pipeline_test_max_entries = 3
+        self.pipeline_test_min_ticks_between = 3
+        self._pipeline_test_entries_sent = 0
+        self._pipeline_test_last_entry_tick: Optional[int] = None
+
     def shutdown(self) -> None:
         self._stopping = True
         try:
@@ -122,13 +129,12 @@ class BotApp:
 
         try:
             pos = self.client.get_positions()
-            if isinstance(pos, dict):
-                positions = pos.get("positions") if isinstance(pos.get("positions"), list) else []
-                snap.open_positions_count = len(positions)
-                snap.open_exposure_dollars = min(
-                    self.settings.MAX_OPEN_EXPOSURE_DOLLARS,
-                    len(positions) * self.settings.MIN_TRADE_DOLLARS,
-                )
+            positions = self._extract_positions_list(pos)
+            snap.open_positions_count = len(positions)
+            snap.open_exposure_dollars = min(
+                self.settings.MAX_OPEN_EXPOSURE_DOLLARS,
+                len(positions) * self.settings.MIN_TRADE_DOLLARS,
+            )
         except Exception as e:
             self.logger.warning(f"Positions fetch failed: {e}")
 
@@ -149,10 +155,29 @@ class BotApp:
             return None
 
     def _extract_positions_list(self, payload: Any) -> list[dict]:
+        """
+        Normalize multiple possible position payload layouts from client/API:
+
+        - {"positions": [...]}
+        - {"market_positions": [...]}
+        - {"event_positions": [...]}
+        - raw list [...]
+        """
         if isinstance(payload, dict):
-            p = payload.get("positions")
-            if isinstance(p, list):
-                return [x for x in p if isinstance(x, dict)]
+            for key in ("positions", "market_positions", "event_positions"):
+                p = payload.get(key)
+                if isinstance(p, list):
+                    return [x for x in p if isinstance(x, dict)]
+
+            # some APIs nest one level deeper
+            for outer in ("data", "result", "response"):
+                nested = payload.get(outer)
+                if isinstance(nested, dict):
+                    for key in ("positions", "market_positions", "event_positions"):
+                        p = nested.get(key)
+                        if isinstance(p, list):
+                            return [x for x in p if isinstance(x, dict)]
+
         if isinstance(payload, list):
             return [x for x in payload if isinstance(x, dict)]
         return []
@@ -222,13 +247,90 @@ class BotApp:
                 continue
         return None
 
+    def _synthetic_open_position_from_decisions(self, ticker: str) -> Optional[dict]:
+        """
+        DRY_RUN fallback only:
+        If the API position endpoint doesn't report simulated positions, derive a best-effort
+        open position from recent decision rows so exit pipeline can be validated.
+        """
+        if not bool(self.settings.DRY_RUN):
+            return None
+
+        try:
+            rows = self.store.recent_decisions(400)
+        except Exception:
+            return None
+
+        for r in rows:
+            if bool(r.get("dry_run", True)) != bool(self.settings.DRY_RUN):
+                continue
+            if str(r.get("ticker", "")) != str(ticker):
+                continue
+
+            action = str(r.get("action", "") or "")
+            if action.startswith("TRADE_EXIT"):
+                return None
+            if action not in {"TRADE_YES", "TRADE_NO"}:
+                continue
+
+            reasons = str(r.get("reasons", "") or "")
+            entry_px: Optional[int] = None
+            count: Optional[int] = None
+
+            for part in reasons.split(";"):
+                part = part.strip()
+                if part.startswith("entry_price_cents:"):
+                    try:
+                        entry_px = int(float(part.split(":", 1)[1].strip()))
+                    except Exception:
+                        pass
+                elif part.startswith("exit_count:"):
+                    # ignore exit metadata from other rows
+                    pass
+                elif part.startswith("order_count:"):
+                    try:
+                        count = int(float(part.split(":", 1)[1].strip()))
+                    except Exception:
+                        pass
+
+            # fallback count estimate from stake/price if not explicitly logged
+            if not count or count <= 0:
+                stake = self._to_float(r.get("stake_dollars")) or 0.0
+                if entry_px and entry_px > 0:
+                    # $1 per contract payout scale -> cents to dollars
+                    # conservative estimate, minimum 1 if trade exists
+                    try:
+                        est = int(round((stake * 100.0) / float(entry_px)))
+                        count = max(1, est)
+                    except Exception:
+                        count = 1
+                else:
+                    count = 1
+
+            opened_ts = r.get("ts")
+            side = "YES" if action == "TRADE_YES" else "NO"
+            synthetic = {
+                "ticker": ticker,
+                "yes_no": side,
+                "count": int(max(1, count)),
+                "entry_price_cents": entry_px,
+                "opened_at": opened_ts,
+                "_synthetic_from_decisions": True,
+            }
+            self.logger.info(
+                f"Synthetic DRY_RUN position inferred for {ticker}: side={side} count={synthetic['count']}"
+            )
+            return synthetic
+
+        return None
+
     def _find_open_position_for_ticker(self, ticker: str) -> Optional[dict]:
         try:
             raw = self.client.get_positions()
             positions = self._extract_positions_list(raw)
         except Exception as e:
             self.logger.warning(f"Position scan for exits failed: {e}")
-            return None
+            positions = []
 
         for p in positions:
             if self._position_ticker(p) != ticker:
@@ -237,7 +339,9 @@ class BotApp:
             side = self._position_contract_side(p)
             if count > 0 and side in {"YES", "NO"}:
                 return p
-        return None
+
+        # DRY_RUN fallback if API doesn't expose simulated positions
+        return self._synthetic_open_position_from_decisions(ticker)
 
     def _latest_entry_context_for_ticker(self, ticker: str) -> dict:
         """
@@ -418,6 +522,77 @@ class BotApp:
                 return False, reasons
 
         return True, reasons
+
+    # -----------------------------
+    # DRY_RUN pipeline validation helpers
+    # -----------------------------
+    def _should_force_pipeline_test_entry(self, *, sig: Any, chosen: dict) -> bool:
+        """
+        Allow a small number of DRY_RUN test entries even when the strategy/risk path skips,
+        so the full entry -> position read -> exit pipeline can be validated safely.
+
+        Live mode is never affected.
+        """
+        if not bool(self.settings.DRY_RUN):
+            return False
+        if not self.pipeline_test_entries_enabled:
+            return False
+        if self.pipeline_test_max_entries <= 0:
+            return False
+        if self._pipeline_test_entries_sent >= int(self.pipeline_test_max_entries):
+            return False
+
+        # Don't force if strategy already wants to trade normally
+        if str(getattr(sig, "direction", "SKIP") or "SKIP").upper() != "SKIP":
+            return False
+
+        # Avoid forcing if an open position already exists for chosen ticker
+        try:
+            existing = self._find_open_position_for_ticker(str(chosen.get("ticker")))
+            if existing:
+                return False
+        except Exception:
+            pass
+
+        # Tick spacing guard to avoid rapid spam
+        if self._pipeline_test_last_entry_tick is not None:
+            delta = int(self._tick_count) - int(self._pipeline_test_last_entry_tick)
+            if delta < int(self.pipeline_test_min_ticks_between):
+                return False
+
+        return True
+
+    def _build_pipeline_test_order(self, chosen: dict) -> Optional[dict]:
+        """
+        Build a tiny DRY_RUN-only YES buy order using current quote data.
+        This bypasses strategy/risk only for test validation and preserves live behavior.
+        """
+        if not bool(self.settings.DRY_RUN):
+            return None
+
+        yes_ask = self._to_float(chosen.get("yes_ask")) or 0.0
+        yes_bid = self._to_float(chosen.get("yes_bid")) or 0.0
+        mid = self._to_float(chosen.get("mid_yes_cents")) or 50.0
+
+        # Use conservative buy price near ask if available; safe fallbacks otherwise
+        if yes_ask > 0:
+            px = int(round(yes_ask))
+        elif yes_bid > 0:
+            px = int(min(99, max(1, round(yes_bid + 1))))
+        else:
+            px = int(min(99, max(1, round(mid))))
+
+        # Minimal test size (try 1 contract). Let client reject if not possible.
+        count = 1
+
+        return {
+            "ticker": str(chosen["ticker"]),
+            "side": "buy",
+            "yes_no": "yes",
+            "count": int(count),
+            "price_cents": int(max(1, min(99, px))),
+            "client_order_id": f"ptest-{chosen['ticker']}-{int(dt.datetime.now(dt.UTC).timestamp())}",
+        }
 
     def _record_decision_row(self, row: dict) -> Optional[int]:
         inserted_id: Optional[int] = None
@@ -1252,7 +1427,7 @@ class BotApp:
         snapshot = self._fetch_portfolio_snapshot()
 
         # -----------------------------
-        # NEW: Conservative thesis-deterioration exit management
+        # Conservative thesis-deterioration exit management
         # Only applies if an open position exists in the chosen ticker.
         # -----------------------------
         try:
@@ -1332,11 +1507,44 @@ class BotApp:
             reasons.append(f"risk_gate_wr:{recent_win_rate_for_gate:.3f}")
             reasons.append(f"risk_gate_wr_n:{winrate_sample}")
 
-        if sig.direction != "SKIP" and risk.allowed:
-            order = build_limit_order_from_signal(chosen["ticker"], sig.direction, chosen, risk.stake_dollars)
+        # -----------------------------
+        # DRY_RUN-only pipeline test entry (bounded, safe)
+        # Does not alter live behavior or strategy logic.
+        # -----------------------------
+        forced_pipeline_test = False
+        pipeline_test_order = None
+
+        try:
+            if self._should_force_pipeline_test_entry(sig=sig, chosen=chosen):
+                pipeline_test_order = self._build_pipeline_test_order(chosen)
+                if pipeline_test_order is not None:
+                    forced_pipeline_test = True
+                    reasons.append("pipeline_test_entry:1")
+                    reasons.append("pipeline_test_scope:dry_run_only")
+                    self.logger.info(
+                        f"DRY_RUN pipeline test entry armed for {chosen['ticker']} "
+                        f"(count={pipeline_test_order.get('count')} px={pipeline_test_order.get('price_cents')})"
+                    )
+        except Exception as e:
+            self.logger.warning(f"Pipeline test entry check failed (continuing normal logic): {e}")
+
+        should_enter_normal = (sig.direction != "SKIP" and risk.allowed)
+        should_enter_test = bool(forced_pipeline_test and pipeline_test_order is not None)
+
+        if should_enter_normal or should_enter_test:
+            if should_enter_test:
+                order = pipeline_test_order
+                used_direction = "YES"
+                used_stake_dollars = float(max(1.0, self.settings.MIN_TRADE_DOLLARS))
+                reasons.append("risk:pipeline_test_bypass")
+            else:
+                order = build_limit_order_from_signal(chosen["ticker"], sig.direction, chosen, risk.stake_dollars)
+                used_direction = str(sig.direction)
+                used_stake_dollars = float(risk.stake_dollars)
 
             try:
                 reasons.append(f"entry_price_cents:{int(order['price_cents'])}")
+                reasons.append(f"order_count:{int(order['count'])}")
             except Exception:
                 pass
 
@@ -1349,20 +1557,25 @@ class BotApp:
                     price_cents=order["price_cents"],
                     client_order_id=order["client_order_id"],
                 )
-                action = f"TRADE_{sig.direction}"
+                action = f"TRADE_{used_direction}"
                 self.logger.info(
-                    f"{action} {chosen['ticker']} stake=${risk.stake_dollars:.2f} "
+                    f"{action} {chosen['ticker']} stake=${used_stake_dollars:.2f} "
                     f"price={order['price_cents']}c count={order['count']} dry_run={self.settings.DRY_RUN}"
                 )
 
+                if should_enter_test:
+                    self._pipeline_test_entries_sent += 1
+                    self._pipeline_test_last_entry_tick = self._tick_count
+
                 self.notifier.send(
-                    f"📈 {action} `{chosen['ticker']}` | stake=${risk.stake_dollars:.2f} "
+                    f"📈 {action} `{chosen['ticker']}` | stake=${used_stake_dollars:.2f} "
                     f"| conv={final_conviction:.1f} "
                     f"(base {sig.conviction_score:.1f} + social {social.bonus_score:.1f} + news_eff {float(news_applied['effective_news_score']):.1f}) "
                     f"| learning={learning['mode']} x{float(learning['stake_multiplier']):.2f} "
                     f"| news={news['regime']} conf={float(news.get('confidence', 0.0)):.2f} "
                     f"| gate_wr={('n/a' if recent_win_rate_for_gate is None else f'{recent_win_rate_for_gate*100:.1f}%')} "
                     f"| dry_run={self.settings.DRY_RUN}"
+                    f"{' | pipeline_test=1' if should_enter_test else ''}"
                 )
 
             except KalshiAPIError as e:
@@ -1374,6 +1587,8 @@ class BotApp:
                 f"SKIP {chosen['ticker']} | dir={sig.direction} | conv={final_conviction:.1f} | risk={risk.reason}"
             )
 
+        joined_reasons = ";".join(reasons)
+
         row = {
             "ts": now,
             "ticker": chosen["ticker"],
@@ -1381,9 +1596,13 @@ class BotApp:
             "base_conviction": sig.conviction_score,
             "social_bonus": social.bonus_score,
             "final_conviction": final_conviction,
-            "stake_dollars": risk.stake_dollars if action.startswith("TRADE_") else 0.0,
+            "stake_dollars": (
+                float(max(1.0, self.settings.MIN_TRADE_DOLLARS))
+                if (action.startswith("TRADE_") and "pipeline_test_entry:1" in joined_reasons)
+                else (risk.stake_dollars if action.startswith("TRADE_") else 0.0)
+            ),
             "action": action,
-            "reasons": ";".join(reasons),
+            "reasons": joined_reasons,
             "dry_run": self.settings.DRY_RUN,
             "realized_pnl": None,
             "won": None,

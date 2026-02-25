@@ -127,69 +127,149 @@ class BotApp:
         return snap
 
     def _fetch_market_universe(self, pages: int = 5, page_limit: int = 100) -> list[dict]:
-        """
-        Fetch multiple pages of markets and filter out low-quality universe members
-        before _choose_market() ranking.
+    """
+    Fetch multiple pages of markets and build a tradeable universe before _choose_market() ranking.
 
-        Notes:
-        - Requires KalshiClient.get_markets(..., cursor=...) support.
-        - We intentionally filter out provisional + MVE combo markets because they have
-          dominated page-1 results in practice and frequently have unusable quotes.
-        """
-        all_markets: list[dict] = []
-        cursor: Optional[str] = None
+    Preference order:
+    1) non-MVE + non-provisional (best fit for current strategy)
+    2) if none exist in fetched pages, fall back to quote-quality-filtered MVE markets
 
-        total_seen = 0
-        dropped_mve = 0
-        dropped_provisional = 0
-        pages_fetched = 0
+    Notes:
+    - Requires KalshiClient.get_markets(..., cursor=...) support (falls back gracefully if missing).
+    - MVE markets have dominated the feed in practice; fallback mode prevents the bot from stalling.
+    """
+    cursor: Optional[str] = None
+    pages_fetched = 0
 
-        for _ in range(max(1, int(pages))):
+    total_seen = 0
+    dropped_mve = 0
+    dropped_provisional = 0
+    duplicate_tickers = 0
+
+    seen_tickers: set[str] = set()
+    preferred_non_mve: list[dict] = []
+    mve_fallback_candidates: list[dict] = []
+
+    for _ in range(max(1, int(pages))):
+        try:
+            # Preferred path (patched client supports cursor)
+            raw = self.client.get_markets(limit=int(page_limit), cursor=cursor)
+        except TypeError:
+            # Backward compatibility if client hasn't been patched yet
+            raw = self.client.get_markets(limit=int(page_limit))
+
+        page_markets = extract_markets(raw)
+        pages_fetched += 1
+
+        if not page_markets:
+            break
+
+        for m in page_markets:
+            ticker = str(m.get("ticker", "") or "").strip()
+            if not ticker:
+                continue
+
+            if ticker in seen_tickers:
+                duplicate_tickers += 1
+                continue
+            seen_tickers.add(ticker)
+            total_seen += 1
+
+            is_mve = ticker.startswith("KXMVESPORTSMULTIGAMEEXTENDED") or bool(m.get("mve_collection_ticker"))
+            is_provisional = bool(m.get("is_provisional"))
+
+            # Summarize once so we can evaluate fallback quote quality
             try:
-                # Backward compatibility: if client hasn't been patched for cursor yet,
-                # this will raise TypeError and we'll fall back to single-page behavior.
-                raw = self.client.get_markets(limit=page_limit, cursor=cursor)
-            except TypeError:
-                raw = self.client.get_markets(limit=page_limit)
+                s = summarize_market(m)
+            except Exception:
+                # If summary fails, skip quietly from universe construction
+                continue
 
-            page_markets = extract_markets(raw)
-            pages_fetched += 1
+            status_ok = str(s.get("status", "")).lower() in {"active", "open", "trading", "unknown"}
+            spread = float(s.get("spread_cents", 0) or 0)
+            mid = float(s.get("mid_yes_cents", 0) or 0)
+            vol = float(s.get("volume", 0) or 0)
 
-            if not page_markets:
-                break
+            quote_ok_for_fallback = (
+                status_ok
+                and spread > 0
+                and spread <= int(self.settings.MAX_SPREAD_CENTS)
+                and mid > 2
+                and mid < 98
+                and vol >= float(self.settings.MIN_RECENT_VOLUME)
+            )
 
-            total_seen += len(page_markets)
+            if is_mve:
+                dropped_mve += 1
+                if quote_ok_for_fallback:
+                    mve_fallback_candidates.append(m)
+                continue
 
-            for m in page_markets:
-                ticker = str(m.get("ticker", "") or "")
-                is_mve = ticker.startswith("KXMVESPORTSMULTIGAMEEXTENDED") or bool(m.get("mve_collection_ticker"))
-                is_provisional = bool(m.get("is_provisional"))
+            if is_provisional:
+                dropped_provisional += 1
+                continue
 
-                if is_mve:
-                    dropped_mve += 1
-                    continue
-                if is_provisional:
-                    dropped_provisional += 1
-                    continue
+            preferred_non_mve.append(m)
 
-                all_markets.append(m)
+        # Stop if no pagination cursor exists (or raw isn't dict-like)
+        if not isinstance(raw, dict):
+            break
+        cursor = raw.get("cursor")
+        if not cursor:
+            break
 
-            # Stop if no pagination cursor exists (or raw isn't dict-like)
-            if not isinstance(raw, dict):
-                break
-            cursor = raw.get("cursor")
-            if not cursor:
-                break
+        # Early stop if we already built a healthy preferred universe
+        if len(preferred_non_mve) >= 150:
+            break
 
+    if preferred_non_mve:
         self.logger.info(
-            "Universe fetch | seen=%s kept=%s dropped_mve=%s dropped_provisional=%s pages=%s",
+            "Universe fetch | seen=%s kept=%s dropped_mve=%s dropped_provisional=%s dupes=%s "
+            "fallback_mve_candidates=%s pages=%s",
             total_seen,
-            len(all_markets),
+            len(preferred_non_mve),
             dropped_mve,
             dropped_provisional,
+            duplicate_tickers,
+            len(mve_fallback_candidates),
             pages_fetched,
         )
-        return all_markets
+        return preferred_non_mve
+
+    # Fallback mode: feed is MVE-dominated, so return only quote-quality MVE names
+    if mve_fallback_candidates:
+        ranked = []
+        for m in mve_fallback_candidates:
+            try:
+                ranked.append(summarize_market(m))
+            except Exception:
+                continue
+
+        ranked.sort(key=lambda x: (x["spread_cents"], abs(x["mid_yes_cents"] - 50), -x["volume"]))
+        fallback_markets = [r.get("raw", {}) for r in ranked if r.get("raw")][:150]
+
+        self.logger.warning(
+            "Universe fetch fallback ACTIVE | seen=%s kept_non_mve=0 dropped_mve=%s dropped_provisional=%s "
+            "dupes=%s mve_fallback_kept=%s pages=%s",
+            total_seen,
+            dropped_mve,
+            dropped_provisional,
+            duplicate_tickers,
+            len(fallback_markets),
+            pages_fetched,
+        )
+        return fallback_markets
+
+    self.logger.warning(
+        "Universe fetch | seen=%s kept=0 dropped_mve=%s dropped_provisional=%s dupes=%s "
+        "mve_fallback_kept=0 pages=%s",
+        total_seen,
+        dropped_mve,
+        dropped_provisional,
+        duplicate_tickers,
+        pages_fetched,
+    )
+    return []
 
     def _choose_market(self, markets: list[dict]) -> Any:
         candidates = []

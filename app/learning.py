@@ -95,7 +95,7 @@ def _category_bias_info(resolved_trades_desc: List[dict]) -> tuple[Optional[str]
     Lightweight category performance check.
     Returns:
       (best_category_or_none, category_multiplier_hint, reason)
-    This is intentionally small influence (handled as part of stake multiplier).
+    Small influence only.
     """
     stats: dict[str, dict[str, float]] = {}
 
@@ -106,9 +106,10 @@ def _category_bias_info(resolved_trades_desc: List[dict]) -> tuple[Optional[str]
         cat = str(cat).strip().lower()
         if not cat:
             continue
-        stats.setdefault(cat, {"n": 0.0, "pnl": 0.0, "wins": 0.0, "losses": 0.0})
 
+        stats.setdefault(cat, {"n": 0.0, "pnl": 0.0, "wins": 0.0, "losses": 0.0})
         stats[cat]["n"] += 1
+
         pnl = r.get("realized_pnl")
         if pnl is not None:
             stats[cat]["pnl"] += _safe_float(pnl)
@@ -122,22 +123,73 @@ def _category_bias_info(resolved_trades_desc: List[dict]) -> tuple[Optional[str]
     if not stats:
         return None, 1.0, "no_category_data"
 
-    # Need some sample size before trusting category effects
     eligible = {k: v for k, v in stats.items() if v["n"] >= 3}
     if not eligible:
         return None, 1.0, "category_sample_too_small"
 
-    # Pick best by pnl then wins
-    best_cat = max(eligible.items(), key=lambda kv: (kv[1]["pnl"], kv[1]["wins"] - kv[1]["losses"]))
+    best_cat = max(
+        eligible.items(),
+        key=lambda kv: (kv[1]["pnl"], kv[1]["wins"] - kv[1]["losses"])
+    )
     cat, m = best_cat
 
-    # Small multiplier hint only
-    # positive category pnl => tiny boost; negative => tiny dampening
+    # Tiny influence to avoid overfitting categories
     if m["pnl"] > 0:
         return cat, 1.03, f"category_positive:{cat}"
     if m["pnl"] < 0:
-        return cat, 0.97, f"category_negative:{cat}"
+        return cat, 0.98, f"category_negative:{cat}"
     return cat, 1.0, f"category_neutral:{cat}"
+
+
+def _weighted_outcome_metrics(outcome_rows_desc: List[dict]) -> dict:
+    """
+    Newest-first rows.
+    Recency-weighted metrics so recent results matter more without fully ignoring history.
+    """
+    # weights decay gently: 1.0, 0.93, 0.86...
+    weight = 1.0
+    decay = 0.93
+
+    w_wins = 0.0
+    w_losses = 0.0
+    w_pnl_sum = 0.0
+    w_pnl_weight = 0.0
+
+    classified_count = 0
+    pnl_count = 0
+
+    for r in outcome_rows_desc:
+        wv = _won_value(r)
+        if wv == 1:
+            w_wins += weight
+            classified_count += 1
+        elif wv == 0:
+            w_losses += weight
+            classified_count += 1
+
+        pnl = r.get("realized_pnl")
+        if pnl is not None:
+            p = _safe_float(pnl)
+            w_pnl_sum += p * weight
+            w_pnl_weight += weight
+            pnl_count += 1
+
+        weight *= decay
+
+    weighted_wr = None
+    if (w_wins + w_losses) > 0:
+        weighted_wr = w_wins / (w_wins + w_losses)
+
+    weighted_expectancy = None
+    if w_pnl_weight > 0:
+        weighted_expectancy = w_pnl_sum / w_pnl_weight
+
+    return {
+        "weighted_win_rate": weighted_wr,
+        "weighted_expectancy": weighted_expectancy,
+        "classified_count": classified_count,
+        "pnl_count": pnl_count,
+    }
 
 
 def compute_learning_adjustment(recent_decisions: List[dict]) -> LearningAdjustment:
@@ -177,7 +229,6 @@ def compute_learning_adjustment(recent_decisions: List[dict]) -> LearningAdjustm
     # -----------------------------------------------------------
     # A) Outcome-aware learning (preferred)
     # -----------------------------------------------------------
-    # Only count resolved trades with at least a won/loss signal OR pnl
     outcome_rows = [
         r for r in resolved
         if (_won_value(r) is not None) or (r.get("realized_pnl") is not None)
@@ -205,11 +256,19 @@ def compute_learning_adjustment(recent_decisions: List[dict]) -> LearningAdjustm
         dd_proxy = _rolling_drawdown_proxy(outcome_rows)
         loss_streak = _loss_streak(outcome_rows)
 
+        weighted = _weighted_outcome_metrics(outcome_rows)
+        w_wr = weighted["weighted_win_rate"]
+        w_exp = weighted["weighted_expectancy"]
+
         reasons.append(f"resolved={len(outcome_rows)}")
         if win_rate is not None:
             reasons.append(f"wr={win_rate*100:.1f}%")
+        if w_wr is not None:
+            reasons.append(f"w_wr={w_wr*100:.1f}%")
         reasons.append(f"pnl={rolling_pnl:.2f}")
         reasons.append(f"exp={expectancy:.3f}")
+        if w_exp is not None:
+            reasons.append(f"w_exp={w_exp:.3f}")
         reasons.append(f"dd={dd_proxy:.2f}")
         reasons.append(f"loss_streak={loss_streak}")
 
@@ -217,52 +276,92 @@ def compute_learning_adjustment(recent_decisions: List[dict]) -> LearningAdjustm
         _, cat_mult_hint, cat_reason = _category_bias_info(outcome_rows)
         reasons.append(cat_reason)
 
-        # ---- De-risk conditions first (priority) ----
-        if loss_streak >= 3:
-            stake_multiplier *= 0.80
+        # Blend raw + weighted for smoother behavior
+        # If one metric is missing, fall back to the one that exists.
+        eff_wr = None
+        if win_rate is not None and w_wr is not None:
+            eff_wr = (0.45 * win_rate) + (0.55 * w_wr)
+        elif w_wr is not None:
+            eff_wr = w_wr
+        elif win_rate is not None:
+            eff_wr = win_rate
+
+        eff_exp = None
+        if pnl_vals and w_exp is not None:
+            eff_exp = (0.40 * expectancy) + (0.60 * w_exp)
+        elif pnl_vals:
+            eff_exp = expectancy
+        elif w_exp is not None:
+            eff_exp = w_exp
+
+        if eff_wr is not None:
+            reasons.append(f"eff_wr={eff_wr*100:.1f}%")
+        if eff_exp is not None:
+            reasons.append(f"eff_exp={eff_exp:.3f}")
+
+        # ---- De-risk conditions first (moderate, not excessive) ----
+        # Multipliers compound, so keep each change small/moderate.
+        if loss_streak >= 4:
+            stake_multiplier *= 0.78
             conviction_adjustment += 4.0
             mode = "de_risk_loss_streak"
-            reasons.append("3+ consecutive losses")
+            reasons.append("4+ consecutive losses")
+        elif loss_streak == 3:
+            stake_multiplier *= 0.86
+            conviction_adjustment += 2.5
+            mode = "de_risk_loss_streak"
+            reasons.append("3 consecutive losses")
 
-        if win_rate is not None and total_classified >= 5 and win_rate < 0.45:
-            stake_multiplier *= 0.85
-            conviction_adjustment += 3.0
-            mode = "de_risk_low_winrate"
-            reasons.append("low_win_rate")
+        if eff_wr is not None and total_classified >= 6 and eff_wr < 0.44:
+            stake_multiplier *= 0.88
+            conviction_adjustment += 2.5
+            if mode == "neutral":
+                mode = "de_risk_low_winrate"
+            reasons.append("low_effective_win_rate")
 
-        if expectancy < 0:
-            stake_multiplier *= 0.90
-            conviction_adjustment += 2.0
+        if eff_exp is not None and eff_exp < 0:
+            stake_multiplier *= 0.92
+            conviction_adjustment += 1.5
             if mode == "neutral":
                 mode = "de_risk_negative_expectancy"
-            reasons.append("negative_expectancy")
+            reasons.append("negative_effective_expectancy")
 
-        if dd_proxy >= max(10.0, avg_stake * 1.5):
-            stake_multiplier *= 0.90
-            conviction_adjustment += 2.0
+        # Drawdown threshold scales with observed stake so it doesn't choke small accounts
+        dd_threshold = max(12.0, avg_stake * 2.0)
+        if dd_proxy >= dd_threshold:
+            stake_multiplier *= 0.92
+            conviction_adjustment += 1.5
             if mode == "neutral":
                 mode = "de_risk_drawdown"
             reasons.append("drawdown_proxy_elevated")
 
-        # ---- Risk-on conditions (only if not clearly in de-risk) ----
+        # ---- Controlled risk-on (only when truly earning it) ----
+        # This is intentionally easier than "perfect regime", so it still stands on business.
         can_risk_on = True
-        if loss_streak >= 2:
+        if loss_streak >= 3:
             can_risk_on = False
-        if expectancy <= 0:
+        if eff_exp is not None and eff_exp <= 0:
             can_risk_on = False
-        if win_rate is not None and win_rate < 0.50:
+        if eff_wr is not None and total_classified >= 6 and eff_wr < 0.50:
             can_risk_on = False
 
         if can_risk_on and total_classified >= 8:
-            if win_rate is not None and win_rate >= 0.58 and expectancy > 0:
-                stake_multiplier *= 1.10
+            # Base risk-on if decent regime
+            if eff_wr is not None and eff_wr >= 0.56 and (eff_exp is None or eff_exp > 0):
+                stake_multiplier *= 1.08
                 conviction_adjustment -= 1.0
                 mode = "risk_on_outcomes"
-                reasons.append("good_winrate_expectancy")
+                reasons.append("good_effective_wr_expectancy")
 
-            if win_rate is not None and win_rate >= 0.65 and expectancy > 0 and dd_proxy < max(6.0, avg_stake):
+            # Stronger but still bounded
+            if (
+                eff_wr is not None
+                and eff_wr >= 0.62
+                and (eff_exp is not None and eff_exp > 0)
+                and dd_proxy < max(8.0, avg_stake * 1.2)
+            ):
                 stake_multiplier *= 1.05
-                conviction_adjustment -= 1.0
+                conviction_adjustment -= 0.5
                 mode = "risk_on_strong"
                 reasons.append("strong_outcome_regime")
 
@@ -276,8 +375,9 @@ def compute_learning_adjustment(recent_decisions: List[dict]) -> LearningAdjustm
         reasons.append(f"resolved={len(outcome_rows)}")
         reasons.append("using_proxy_logic")
 
+        # Risk-on proxy is mild; avoid overconfidence
         if len(trades) >= 10 and avg_conv >= 68:
-            stake_multiplier += 0.10
+            stake_multiplier += 0.08
             mode = "risk_on_proxy"
             reasons.append("high_avg_conviction")
 
@@ -288,16 +388,23 @@ def compute_learning_adjustment(recent_decisions: List[dict]) -> LearningAdjustm
 
         # If conviction is low despite many trades, tighten slightly
         if len(trades) >= 10 and avg_conv < 55:
-            conviction_adjustment += 2.0
+            conviction_adjustment += 1.5
             if mode == "neutral":
                 mode = "tighten_proxy"
             reasons.append("low_avg_conviction")
 
+        # If it's trading a lot with almost no skips, nudge threshold up a bit to avoid spray-and-pray
+        if len(trades) >= 12 and len(skips) <= 1:
+            conviction_adjustment += 1.0
+            if mode == "neutral":
+                mode = "discipline_proxy"
+            reasons.append("very_low_skips_many_trades")
+
     # -----------------------------------------------------------
     # C) Global caps / sanity
     # -----------------------------------------------------------
-    # Keep adaptive behavior meaningful but bounded.
-    stake_multiplier = max(0.70, min(1.30, stake_multiplier))
+    # Bounded but not too tight (lets it express adaptation).
+    stake_multiplier = max(0.72, min(1.32, stake_multiplier))
     conviction_adjustment = max(-5.0, min(6.0, conviction_adjustment))
 
     if not reasons:

@@ -951,6 +951,7 @@ class BotApp:
         2) relaxed fallback path for MVE/one-sided quote conditions
            - still requires valid status + some quote signal
            - applies an effective spread penalty to low-quality quotes
+           - avoids ultra-extreme tails that almost always become signal SKIPs
         """
         ok_status = {"active", "open", "trading", "unknown"}
 
@@ -997,6 +998,11 @@ class BotApp:
             float(self.settings.MAX_SPREAD_CENTS) + 5.0,
         )
 
+        # Guardrail to reduce repeated selection of ultra-extreme MVE tails (e.g., 3c / 97c)
+        # Keep this only in relaxed mode so strict behavior remains unchanged.
+        relaxed_mid_floor = 8.0
+        relaxed_mid_ceiling = 92.0
+
         for m in markets[:200]:
             try:
                 s = summarize_market(m)
@@ -1016,8 +1022,12 @@ class BotApp:
             if yes_bid <= 0 and yes_ask <= 0 and mid <= 0:
                 continue
 
-            # Avoid extreme tails / broken quotes
+            # Avoid broken quotes
             if mid and (mid <= 1 or mid >= 99):
+                continue
+
+            # NEW: relaxed-mode tail guard (prevents selecting markets your signal almost always skips)
+            if mid and (mid < relaxed_mid_floor or mid > relaxed_mid_ceiling):
                 continue
 
             # Use reported spread if usable; otherwise infer; otherwise heavily penalize one-sided quotes
@@ -1034,6 +1044,7 @@ class BotApp:
             s["_pick_mode"] = "relaxed"
             s["_effective_spread"] = effective_spread
             s["_relaxed"] = True
+            s["_relaxed_mid_guard"] = f"{relaxed_mid_floor:.0f}-{relaxed_mid_ceiling:.0f}"
             s["_volume_for_sort"] = volume
             relaxed_candidates.append(s)
 

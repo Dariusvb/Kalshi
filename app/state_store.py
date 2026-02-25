@@ -82,6 +82,7 @@ class StateStore:
         self._ensure_column("decisions", "news_score", "REAL", None)
         self._ensure_column("decisions", "news_confidence", "REAL", None)
         self._ensure_column("decisions", "news_regime", "TEXT", None)
+        self._ensure_column("decisions", "news_effective_score", "REAL", None)  # <-- added
         self._ensure_column("decisions", "spread_cents", "INTEGER", None)
 
         # Helpful indexes
@@ -93,6 +94,8 @@ class StateStore:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_decisions_resolved_ts ON decisions(resolved_ts)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_decisions_market_category ON decisions(market_category)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_decisions_news_regime ON decisions(news_regime)")
+        # Optional but useful for later analytics/backtests
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_decisions_news_effective_score ON decisions(news_effective_score)")
         self.conn.commit()
 
     def insert_decision(self, row: Dict[str, Any]) -> int:
@@ -107,8 +110,8 @@ class StateStore:
                 ts, ticker, direction, base_conviction, social_bonus, final_conviction,
                 stake_dollars, action, reasons, dry_run,
                 realized_pnl, won, resolved_ts, market_category,
-                news_score, news_confidence, news_regime, spread_cents
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                news_score, news_confidence, news_regime, news_effective_score, spread_cents
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             row["ts"],
             row["ticker"],
@@ -127,6 +130,7 @@ class StateStore:
             self._maybe_float(row.get("news_score")),
             self._maybe_float(row.get("news_confidence")),
             row.get("news_regime"),
+            self._maybe_float(row.get("news_effective_score")),  # <-- added
             self._maybe_int(row.get("spread_cents")),
         ))
         self.conn.commit()

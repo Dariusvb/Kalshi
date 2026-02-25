@@ -64,13 +64,22 @@ class BotApp:
         self.paper_resolver_max_to_check = 25
 
         # Risk-on suppression inputs (not trade blocking)
-        self.min_resolved_for_winrate_gate = 6           # require some sample size
-        self.min_winrate_for_risk_on_gate = 0.48         # slightly looser than 0.50 so it isn't too timid
+        self.min_resolved_for_winrate_gate = 6
+        self.min_winrate_for_risk_on_gate = 0.48
 
         # News signal defaults (bounded, optional)
         self.news_signal_enabled = True
         self.news_max_abs_score = 8.0
         self.news_require_two_credible_sources = True
+
+        # News application controls (important: keeps core signal dominant)
+        self.news_min_confidence_to_apply = 0.35          # below this -> mostly ignore
+        self.news_full_confidence_at = 0.75               # at/above this -> full effect
+        self.news_conflict_penalty_multiplier = 0.35      # conflicting news only partially counts
+        self.news_neutral_regime_multiplier = 0.40        # noisy/weak regime gets heavily damped
+        self.news_mixed_regime_multiplier = 0.60          # mixed/conflicting reports damped
+        self.news_abs_effect_cap_on_conviction = 6.0      # final effective news impact cap
+        self.news_allow_direction_flip = False            # don't let news reverse trade direction logic
 
         # Scorecard cadence (every N ticks)
         self.scorecard_summary_every_n_ticks = 30
@@ -102,13 +111,11 @@ class BotApp:
         except Exception as e:
             self.logger.warning(f"Balance fetch failed: {e}")
 
-        # MVP: positions endpoint parsing can be tightened after seeing your exact payload
         try:
             pos = self.client.get_positions()
             if isinstance(pos, dict):
                 positions = pos.get("positions") if isinstance(pos.get("positions"), list) else []
                 snap.open_positions_count = len(positions)
-                # rough placeholder; improve after payload inspection
                 snap.open_exposure_dollars = min(
                     self.settings.MAX_OPEN_EXPOSURE_DOLLARS,
                     len(positions) * self.settings.MIN_TRADE_DOLLARS,
@@ -116,7 +123,6 @@ class BotApp:
         except Exception as e:
             self.logger.warning(f"Positions fetch failed: {e}")
 
-        # MVP daily pnl placeholder = 0 until fills/pnl endpoint normalized
         snap.daily_pnl_dollars = 0.0
         return snap
 
@@ -128,27 +134,21 @@ class BotApp:
             if s["status"].lower() not in {"active", "open", "trading", "unknown"}:
                 continue
 
-            # basic quality filters
             if s["spread_cents"] <= 0 or s["spread_cents"] > self.settings.MAX_SPREAD_CENTS:
                 continue
             if s["volume"] < self.settings.MIN_RECENT_VOLUME:
                 continue
 
-            # avoid ultra-extreme dead zones for MVP strategy
             mid = s["mid_yes_cents"]
             if mid <= 2 or mid >= 98:
                 continue
 
             candidates.append(s)
 
-        # prioritize good spread + healthy volume + non-extreme pricing
         candidates.sort(key=lambda x: (x["spread_cents"], abs(x["mid_yes_cents"] - 50), -x["volume"]))
         return candidates[0] if candidates else None
 
     def _compute_learning(self, recent: list[dict]) -> dict:
-        """
-        Returns a normalized dict so main loop stays stable whether learning.py exists or not.
-        """
         if compute_learning_adjustment is None:
             return {
                 "stake_multiplier": 1.0,
@@ -175,10 +175,6 @@ class BotApp:
             }
 
     def _mode_stats_from_decisions(self, decisions: list[dict]) -> dict:
-        """
-        Splits stats for simulated vs live decisions.
-        If rows include realized_pnl / won / resolved_ts, those will show.
-        """
         def summarize_mode(rows: list[dict]) -> dict:
             total = len(rows)
             trades = [r for r in rows if str(r.get("action", "")).startswith("TRADE")]
@@ -214,11 +210,7 @@ class BotApp:
 
         sim_rows = [d for d in decisions if bool(d.get("dry_run", True))]
         live_rows = [d for d in decisions if not bool(d.get("dry_run", True))]
-
-        return {
-            "sim": summarize_mode(sim_rows),
-            "live": summarize_mode(live_rows),
-        }
+        return {"sim": summarize_mode(sim_rows), "live": summarize_mode(live_rows)}
 
     def _compute_recent_winrate_for_risk_gate(
         self,
@@ -227,13 +219,6 @@ class BotApp:
         use_dry_run_mode: bool,
         lookback_resolved: int = 12,
     ) -> tuple[Optional[float], int]:
-        """
-        Compute recent win rate for risk-on gating only (not trade blocking).
-        Returns (win_rate_0_to_1_or_None, resolved_classified_count)
-
-        Uses only resolved TRADE_* rows in the same mode (dry_run vs live).
-        If sample size is too small, returns None so risk engine won't suppress risk-on.
-        """
         mode_rows = [d for d in decisions if bool(d.get("dry_run", True)) == bool(use_dry_run_mode)]
         resolved_trades = [
             d for d in mode_rows
@@ -261,36 +246,15 @@ class BotApp:
     # News / scorecard helpers
     # -----------------------------
     def _news_category_allowlist(self) -> list[str]:
-        """
-        Start narrow. Expand only after scorecard proves value.
-        """
         return ["politics", "weather", "sports", "macro"]
 
     def _fetch_news_items_for_market(self, chosen: dict) -> list[dict]:
         """
         Placeholder adapter for future real news integration.
-        Returns [] until you wire an actual provider.
-
-        Expected item schema (flexible, used by app.news_signal):
-        {
-            "title": str,
-            "url": str,
-            "source": str,
-            "domain": str,                  # optional if url provided
-            "published_at": ISO str,        # or published_ts
-            "direction_hint": "YES|NO|NEUTRAL",
-            "strength": float (0..1),
-            "official_confirmation": bool,  # optional
-            "secondary_confirmation": bool, # optional
-        }
         """
-        # TODO: Wire to a real news collector/provider and map the category/ticker to relevant queries.
         return []
 
     def _compute_news_signal(self, chosen: dict) -> dict:
-        """
-        Safe wrapper around optional news_signal module. Always returns normalized dict.
-        """
         if not self.news_signal_enabled or evaluate_news_signal is None:
             return {
                 "score": 0.0,
@@ -347,6 +311,85 @@ class BotApp:
                 "n_tier3": 0,
             }
 
+    def _apply_news_to_conviction(
+        self,
+        *,
+        base_signal_direction: str,
+        base_conviction: float,
+        social_bonus: float,
+        news: dict,
+    ) -> tuple[float, dict]:
+        """
+        Convert raw news score into an *effective* conviction adjustment.
+
+        Design goals:
+        - news should help, not dominate
+        - low-confidence/noisy news should barely move anything
+        - conflicting news should dampen, not hijack, by default
+        """
+        raw_news_score = float(news.get("score", 0.0))
+        news_conf = max(0.0, min(1.0, float(news.get("confidence", 0.0))))
+        news_regime = str(news.get("regime", "unavailable"))
+        sig_dir = str(base_signal_direction or "SKIP").upper()
+
+        # No directional trade -> still compute for logging, but don't force action logic
+        # (it only affects final conviction if a trade signal already exists downstream)
+        # Confidence scaling with floor
+        if news_conf <= self.news_min_confidence_to_apply:
+            conf_scale = 0.10  # tiny effect, not zero (useful for logging/experiments)
+        elif news_conf >= self.news_full_confidence_at:
+            conf_scale = 1.00
+        else:
+            span = max(1e-9, self.news_full_confidence_at - self.news_min_confidence_to_apply)
+            conf_scale = 0.10 + 0.90 * ((news_conf - self.news_min_confidence_to_apply) / span)
+
+        # Regime scaling
+        regime_scale = 1.0
+        if news_regime in {"noisy_or_weak", "unavailable", "disabled", "error_fallback"}:
+            regime_scale = self.news_neutral_regime_multiplier
+        elif news_regime in {"mixed"}:
+            regime_scale = self.news_mixed_regime_multiplier
+
+        # Directional compatibility check (raw news score >0 implies YES-ish; <0 implies NO-ish)
+        # If signal is YES and news is negative (or vice versa), dampen heavily.
+        conflict = False
+        if sig_dir == "YES" and raw_news_score < 0:
+            conflict = True
+        elif sig_dir == "NO" and raw_news_score > 0:
+            conflict = True
+
+        direction_scale = self.news_conflict_penalty_multiplier if conflict else 1.0
+
+        effective_news_score = raw_news_score * conf_scale * regime_scale * direction_scale
+
+        # Optional safety: do not allow news to push conviction so far that it effectively flips a borderline setup
+        if (not self.news_allow_direction_flip) and conflict:
+            # Clamp conflicting contribution more aggressively
+            effective_news_score = max(-2.0, min(2.0, effective_news_score))
+
+        # Final cap on conviction impact
+        effective_news_score = max(
+            -self.news_abs_effect_cap_on_conviction,
+            min(self.news_abs_effect_cap_on_conviction, effective_news_score),
+        )
+
+        final_conviction = min(
+            100.0,
+            max(0.0, float(base_conviction) + float(social_bonus) + effective_news_score),
+        )
+
+        meta = {
+            "raw_news_score": round(raw_news_score, 3),
+            "effective_news_score": round(float(effective_news_score), 3),
+            "news_confidence": round(news_conf, 3),
+            "news_regime": news_regime,
+            "news_conf_scale": round(conf_scale, 3),
+            "news_regime_scale": round(regime_scale, 3),
+            "news_direction_scale": round(direction_scale, 3),
+            "news_conflicts_signal": conflict,
+        }
+        return final_conviction, meta
+
     def _extract_recent_setup_scorecard(self, lookback: int = 200) -> Optional[dict]:
         if build_setup_scorecard is None:
             return None
@@ -358,9 +401,6 @@ class BotApp:
             return None
 
     def _maybe_send_scorecard_summary(self) -> None:
-        """
-        Send less frequently than normal summaries to avoid spam.
-        """
         if build_setup_scorecard is None or summarize_scorecard_for_discord is None:
             return
         if self.scorecard_summary_every_n_ticks <= 0:
@@ -378,10 +418,6 @@ class BotApp:
             self.logger.warning(f"Scorecard summary failed: {e}")
 
     def _maybe_send_periodic_summary(self, snapshot: PortfolioSnapshot, recent: list[dict]) -> None:
-        """
-        Sends a lightweight Discord summary approximately every 10 ticks.
-        Avoids spamming every minute if interval is short.
-        """
         if not recent:
             return
         if (self._tick_count % 10) != 0:
@@ -426,7 +462,6 @@ class BotApp:
         chosen = self._choose_market(markets)
         if not chosen:
             self.logger.info("No candidate market found.")
-            # still emit periodic summary even on no-candidate ticks
             snapshot = self._fetch_portfolio_snapshot()
             recent = self.store.recent_decisions(80)
             self._maybe_send_periodic_summary(snapshot, recent)
@@ -438,7 +473,6 @@ class BotApp:
             f"| spread={chosen['spread_cents']} | vol={chosen['volume']}"
         )
 
-        # Use a larger window so outcome-aware learning has enough resolved trades
         recent_for_learning = self.store.recent_decisions(80)
         learning = self._compute_learning(recent_for_learning)
 
@@ -467,25 +501,32 @@ class BotApp:
 
         news = self._compute_news_signal(chosen)
         self.logger.info(
-            f"News signal regime={news['regime']} score={news['score']:.2f} conf={news['confidence']:.2f} "
+            f"News signal regime={news['regime']} raw_score={news['score']:.2f} conf={news['confidence']:.2f} "
             f"items={news['n_items']}/{news['n_unique']} t1={news['n_tier1']} t2={news['n_tier2']} t3={news['n_tier3']} "
             f"reasons={news['reasons']} flags={news['risk_flags']}"
         )
 
-        # Bounded additive conviction; news should not dominate core signal
-        final_conviction = min(
-            100.0,
-            max(0.0, sig.conviction_score + social.bonus_score + float(news["score"])),
+        # Apply news safely (confidence + regime + direction aware)
+        final_conviction, news_applied = self._apply_news_to_conviction(
+            base_signal_direction=sig.direction,
+            base_conviction=float(sig.conviction_score),
+            social_bonus=float(social.bonus_score),
+            news=news,
+        )
+
+        self.logger.info(
+            "News applied "
+            f"raw={news_applied['raw_news_score']:.2f} eff={news_applied['effective_news_score']:.2f} "
+            f"conf_scale={news_applied['news_conf_scale']:.2f} regime_scale={news_applied['news_regime_scale']:.2f} "
+            f"dir_scale={news_applied['news_direction_scale']:.2f} conflict={news_applied['news_conflicts_signal']}"
         )
 
         snapshot = self._fetch_portfolio_snapshot()
 
-        # modest risk-on size boost only when both signal and social are supportive
         social_size_boost = 0.0
         if sig.direction != "SKIP" and social.bonus_score > 0:
             social_size_boost = min(self.settings.SOCIAL_SIZE_BOOST_MAX_PCT, social.bonus_score / 100.0)
 
-        # Risk-on suppression gate (NOT trade blocking)
         recent_win_rate_for_gate, winrate_sample = self._compute_recent_winrate_for_risk_gate(
             recent_for_learning,
             use_dry_run_mode=self.settings.DRY_RUN,
@@ -513,8 +554,8 @@ class BotApp:
             max_open_exposure_dollars=self.settings.MAX_OPEN_EXPOSURE_DOLLARS,
             max_simultaneous_positions=self.settings.MAX_SIMULTANEOUS_POSITIONS,
             social_size_boost_pct=social_size_boost,
-            learning_multiplier=float(learning["stake_multiplier"]),  # updated risk_engine.py supports this
-            recent_win_rate=recent_win_rate_for_gate,                 # only suppresses risk-on sizing if weak
+            learning_multiplier=float(learning["stake_multiplier"]),
+            recent_win_rate=recent_win_rate_for_gate,
             min_win_rate_for_risk_on=self.min_winrate_for_risk_on_gate,
         )
 
@@ -525,8 +566,13 @@ class BotApp:
             f"risk:{risk.reason}",
             f"learning_mode:{learning['mode']}",
             f"news:{news['regime']}",
-            f"news_score:{float(news['score']):.2f}",
-            f"news_conf:{float(news['confidence']):.2f}",
+            f"news_score_raw:{float(news.get('score', 0.0)):.2f}",
+            f"news_score_eff:{float(news_applied.get('effective_news_score', 0.0)):.2f}",
+            f"news_conf:{float(news.get('confidence', 0.0)):.2f}",
+            f"news_conf_scale:{float(news_applied.get('news_conf_scale', 0.0)):.2f}",
+            f"news_regime_scale:{float(news_applied.get('news_regime_scale', 0.0)):.2f}",
+            f"news_dir_scale:{float(news_applied.get('news_direction_scale', 0.0)):.2f}",
+            f"news_conflict_sig:{1 if news_applied.get('news_conflicts_signal') else 0}",
         ]
 
         if news.get("risk_flags"):
@@ -539,7 +585,6 @@ class BotApp:
         if sig.direction != "SKIP" and risk.allowed:
             order = build_limit_order_from_signal(chosen["ticker"], sig.direction, chosen, risk.stake_dollars)
 
-            # Store exact simulated/live intended entry for better paper PnL tracking later
             try:
                 reasons.append(f"entry_price_cents:{int(order['price_cents'])}")
             except Exception:
@@ -562,9 +607,10 @@ class BotApp:
 
                 self.notifier.send(
                     f"📈 {action} `{chosen['ticker']}` | stake=${risk.stake_dollars:.2f} "
-                    f"| conv={final_conviction:.1f} (base {sig.conviction_score:.1f} + social {social.bonus_score:.1f} + news {float(news['score']):.1f}) "
+                    f"| conv={final_conviction:.1f} "
+                    f"(base {sig.conviction_score:.1f} + social {social.bonus_score:.1f} + news_eff {float(news_applied['effective_news_score']):.1f}) "
                     f"| learning={learning['mode']} x{float(learning['stake_multiplier']):.2f} "
-                    f"| news={news['regime']} "
+                    f"| news={news['regime']} conf={float(news.get('confidence', 0.0)):.2f} "
                     f"| gate_wr={('n/a' if recent_win_rate_for_gate is None else f'{recent_win_rate_for_gate*100:.1f}%')} "
                     f"| dry_run={self.settings.DRY_RUN}"
                 )
@@ -575,11 +621,9 @@ class BotApp:
                 self.notifier.send(f"⚠️ Kalshi order error: {e}")
         else:
             self.logger.info(
-                f"SKIP {chosen['ticker']} | dir={sig.direction} | conv={final_conviction:.1f} "
-                f"| risk={risk.reason}"
+                f"SKIP {chosen['ticker']} | dir={sig.direction} | conv={final_conviction:.1f} | risk={risk.reason}"
             )
 
-        # Store auditable decision row (outcome fields start null and get updated later)
         row = {
             "ts": now,
             "ticker": chosen["ticker"],
@@ -595,14 +639,36 @@ class BotApp:
             "won": None,
             "resolved_ts": None,
             "market_category": chosen.get("category"),
-            "news_score": float(news["score"]),
-            "news_confidence": float(news["confidence"]),
-            "news_regime": str(news["regime"]),
+            # Optional newer columns (safe if StateStore supports them)
+            "news_score": float(news.get("score", 0.0)),
+            "news_confidence": float(news.get("confidence", 0.0)),
+            "news_regime": str(news.get("regime", "unavailable")),
+            "news_effective_score": float(news_applied.get("effective_news_score", 0.0)),
             "spread_cents": chosen.get("spread_cents"),
         }
-        _inserted_id = self.store.insert_decision(row)
 
-        # Resolve older DRY_RUN trades into paper outcomes so summaries/learning can use W/L + PnL
+        try:
+            _inserted_id = self.store.insert_decision(row)
+        except TypeError:
+            # Backward compatibility if older StateStore insert signature ignores new fields poorly
+            legacy_row = {
+                "ts": row["ts"],
+                "ticker": row["ticker"],
+                "direction": row["direction"],
+                "base_conviction": row["base_conviction"],
+                "social_bonus": row["social_bonus"],
+                "final_conviction": row["final_conviction"],
+                "stake_dollars": row["stake_dollars"],
+                "action": row["action"],
+                "reasons": row["reasons"],
+                "dry_run": row["dry_run"],
+                "realized_pnl": row["realized_pnl"],
+                "won": row["won"],
+                "resolved_ts": row["resolved_ts"],
+                "market_category": row["market_category"],
+            }
+            _inserted_id = self.store.insert_decision(legacy_row)
+
         if self.settings.DRY_RUN and self.paper_resolver_enabled:
             try:
                 rr = resolve_paper_trades(
@@ -619,7 +685,6 @@ class BotApp:
             except Exception as e:
                 self.logger.warning(f"Paper resolver failed: {e}")
 
-        # local logs
         recent20 = self.store.recent_decisions(20)
         summary = summarize_decisions(recent20)
         self.logger.info(f"Recent summary: {summary}")
@@ -628,11 +693,9 @@ class BotApp:
         mode_stats = self._mode_stats_from_decisions(recent50)
         self.logger.info(f"Mode stats (50): {mode_stats}")
 
-        # periodic Discord summary + scorecard
         self._maybe_send_periodic_summary(snapshot, recent50)
         self._maybe_send_scorecard_summary()
 
-        # withdrawal alert (notification-only)
         if snapshot.cash_balance_dollars >= self.settings.WITHDRAWAL_ALERT_THRESHOLD_DOLLARS:
             self.notifier.send(
                 f"💸 Cash balance appears >= ${self.settings.WITHDRAWAL_ALERT_THRESHOLD_DOLLARS:.0f}. "

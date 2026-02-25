@@ -1382,6 +1382,10 @@ class BotApp:
             self._maybe_send_scorecard_summary()
             return
 
+        market_label = str(chosen.get("market_label") or chosen.get("title") or chosen.get("question") or "").strip()
+        if not market_label:
+            market_label = str(chosen.get("ticker") or "")
+
         self.logger.info(
             f"Candidate {chosen['ticker']} | mid={chosen['mid_yes_cents']:.1f} "
             f"| spread={chosen['spread_cents']} | vol={chosen['volume']}"
@@ -1510,6 +1514,9 @@ class BotApp:
             f"news_dir_scale:{float(news_applied.get('news_direction_scale', 0.0)):.2f}",
             f"news_conflict_sig:{1 if news_applied.get('news_conflicts_signal') else 0}",
         ]
+
+        if market_label:
+            reasons.append(f"market_label:{market_label[:140]}")
 
         if news.get("risk_flags"):
             reasons.append(f"news_flags:{','.join(news['risk_flags'])}")

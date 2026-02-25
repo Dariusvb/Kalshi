@@ -813,6 +813,7 @@ class BotApp:
             current_open_exposure=snapshot.open_exposure_dollars,
             open_positions_count=snapshot.open_positions_count,
             daily_pnl=snapshot.daily_pnl_dollars,
+            available_cash_dollars=snapshot.cash_balance_dollars,
             min_dollars=self.settings.MIN_TRADE_DOLLARS,
             max_dollars=self.settings.MAX_TRADE_DOLLARS,
             daily_max_loss_dollars=self.settings.DAILY_MAX_LOSS_DOLLARS,

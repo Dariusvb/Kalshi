@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import os
-import sys
-
 from dotenv import load_dotenv
 
 from app.config import Settings
@@ -22,6 +19,7 @@ def main() -> int:
         return 1
 
     logger.info(f"Starting auth test | env={settings.KALSHI_ENV} | dry_run={settings.DRY_RUN}")
+    logger.info(f"Resolved base_url={settings.base_url}")
 
     client = KalshiClient(
         api_key_id=settings.KALSHI_API_KEY_ID,
@@ -32,12 +30,19 @@ def main() -> int:
     )
 
     try:
-        # Try balance first (authenticated)
-        bal = client.get_portfolio_balance()
-        keys = list(bal.keys())[:10] if isinstance(bal, dict) else []
-        logger.info(f"✅ Auth success. Balance endpoint responded. top_keys={keys}")
+        # --- Public endpoint smoke test first (helps isolate DNS/base-url issues) ---
+        public = client.get_markets(limit=1)
+        if isinstance(public, dict):
+            pkeys = list(public.keys())[:10]
+            logger.info(f"✅ Public markets endpoint responded. top_keys={pkeys}")
+        else:
+            logger.info("✅ Public markets endpoint responded.")
 
-        # Try orders list too
+        # --- Authenticated endpoints ---
+        bal = client.get_portfolio_balance()
+        bkeys = list(bal.keys())[:10] if isinstance(bal, dict) else []
+        logger.info(f"✅ Auth success. Balance endpoint responded. top_keys={bkeys}")
+
         orders = client.list_orders(limit=5)
         okeys = list(orders.keys())[:10] if isinstance(orders, dict) else []
         logger.info(f"✅ Orders endpoint responded. top_keys={okeys}")
@@ -45,7 +50,7 @@ def main() -> int:
 
     except KalshiAuthError as e:
         logger.error(f"❌ Auth failed: {e}")
-        logger.error("Check KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY_PEM formatting, env=demo/prod, and signing code.")
+        logger.error("Check KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY_PEM formatting, key/env pairing (demo vs prod), and signing code.")
         return 2
     except KalshiAPIError as e:
         logger.error(f"❌ API error: {e}")

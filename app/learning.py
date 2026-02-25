@@ -27,6 +27,16 @@ def _is_resolved_trade(row: dict) -> bool:
     return _is_trade(row) and row.get("resolved_ts") is not None
 
 
+def _is_pipeline_test_trade(row: dict) -> bool:
+    """
+    Detect forced pipeline test entries so learning stats can ignore them.
+    Safe for missing/None reasons.
+    """
+    reasons = str(row.get("reasons", "") or "")
+    # primary tag + fallback bypass tag (in case one changes)
+    return ("pipeline_test_entry:1" in reasons) or ("risk:pipeline_test_bypass" in reasons)
+
+
 def _won_value(row: dict) -> Optional[int]:
     """
     Normalize won field to 1/0/None.
@@ -211,12 +221,27 @@ def compute_learning_adjustment(recent_decisions: List[dict]) -> LearningAdjustm
 
     reasons: list[str] = []
 
-    trades = [d for d in recent_decisions if _is_trade(d)]
-    skips = [d for d in recent_decisions if d.get("action") == "SKIP"]
-    resolved = [d for d in recent_decisions if _is_resolved_trade(d)]
+    # Exclude forced pipeline test trades from learning inputs
+    pipeline_test_rows = [d for d in recent_decisions if _is_pipeline_test_trade(d)]
+    learn_rows = [d for d in recent_decisions if not _is_pipeline_test_trade(d)]
+
+    if not learn_rows:
+        return LearningAdjustment(
+            1.0,
+            0.0,
+            "warmup",
+            [f"all_rows_pipeline_tests:{len(pipeline_test_rows)}"]
+        )
+
+    trades = [d for d in learn_rows if _is_trade(d)]
+    skips = [d for d in learn_rows if d.get("action") == "SKIP"]
+    resolved = [d for d in learn_rows if _is_resolved_trade(d)]
+
+    if pipeline_test_rows:
+        reasons.append(f"excluded_pipeline_tests:{len(pipeline_test_rows)}")
 
     if len(trades) < 5:
-        return LearningAdjustment(1.0, 0.0, "warmup", [f"few_trades:{len(trades)}"])
+        return LearningAdjustment(1.0, 0.0, "warmup", reasons + [f"few_trades:{len(trades)}"])
 
     avg_conv = sum(_safe_float(d.get("final_conviction", 0.0)) for d in trades) / max(1, len(trades))
     avg_stake = sum(_safe_float(d.get("stake_dollars", 0.0)) for d in trades) / max(1, len(trades))
@@ -277,7 +302,6 @@ def compute_learning_adjustment(recent_decisions: List[dict]) -> LearningAdjustm
         reasons.append(cat_reason)
 
         # Blend raw + weighted for smoother behavior
-        # If one metric is missing, fall back to the one that exists.
         eff_wr = None
         if win_rate is not None and w_wr is not None:
             eff_wr = (0.45 * win_rate) + (0.55 * w_wr)
@@ -299,8 +323,6 @@ def compute_learning_adjustment(recent_decisions: List[dict]) -> LearningAdjustm
         if eff_exp is not None:
             reasons.append(f"eff_exp={eff_exp:.3f}")
 
-        # ---- De-risk conditions first (moderate, not excessive) ----
-        # Multipliers compound, so keep each change small/moderate.
         if loss_streak >= 4:
             stake_multiplier *= 0.78
             conviction_adjustment += 4.0
@@ -326,7 +348,6 @@ def compute_learning_adjustment(recent_decisions: List[dict]) -> LearningAdjustm
                 mode = "de_risk_negative_expectancy"
             reasons.append("negative_effective_expectancy")
 
-        # Drawdown threshold scales with observed stake so it doesn't choke small accounts
         dd_threshold = max(12.0, avg_stake * 2.0)
         if dd_proxy >= dd_threshold:
             stake_multiplier *= 0.92
@@ -335,8 +356,6 @@ def compute_learning_adjustment(recent_decisions: List[dict]) -> LearningAdjustm
                 mode = "de_risk_drawdown"
             reasons.append("drawdown_proxy_elevated")
 
-        # ---- Controlled risk-on (only when truly earning it) ----
-        # This is intentionally easier than "perfect regime", so it still stands on business.
         can_risk_on = True
         if loss_streak >= 3:
             can_risk_on = False
@@ -346,14 +365,12 @@ def compute_learning_adjustment(recent_decisions: List[dict]) -> LearningAdjustm
             can_risk_on = False
 
         if can_risk_on and total_classified >= 8:
-            # Base risk-on if decent regime
             if eff_wr is not None and eff_wr >= 0.56 and (eff_exp is None or eff_exp > 0):
                 stake_multiplier *= 1.08
                 conviction_adjustment -= 1.0
                 mode = "risk_on_outcomes"
                 reasons.append("good_effective_wr_expectancy")
 
-            # Stronger but still bounded
             if (
                 eff_wr is not None
                 and eff_wr >= 0.62
@@ -365,7 +382,6 @@ def compute_learning_adjustment(recent_decisions: List[dict]) -> LearningAdjustm
                 mode = "risk_on_strong"
                 reasons.append("strong_outcome_regime")
 
-        # Apply tiny category influence at the end
         stake_multiplier *= cat_mult_hint
 
     # -----------------------------------------------------------
@@ -375,25 +391,21 @@ def compute_learning_adjustment(recent_decisions: List[dict]) -> LearningAdjustm
         reasons.append(f"resolved={len(outcome_rows)}")
         reasons.append("using_proxy_logic")
 
-        # Risk-on proxy is mild; avoid overconfidence
         if len(trades) >= 10 and avg_conv >= 68:
             stake_multiplier += 0.08
             mode = "risk_on_proxy"
             reasons.append("high_avg_conviction")
 
         if len(skips) > len(trades) * 2:
-            # Too many skips means we may be filtering too hard; loosen a bit.
             conviction_adjustment -= 2.0
             reasons.append("too_many_skips_loosen_threshold")
 
-        # If conviction is low despite many trades, tighten slightly
         if len(trades) >= 10 and avg_conv < 55:
             conviction_adjustment += 1.5
             if mode == "neutral":
                 mode = "tighten_proxy"
             reasons.append("low_avg_conviction")
 
-        # If it's trading a lot with almost no skips, nudge threshold up a bit to avoid spray-and-pray
         if len(trades) >= 12 and len(skips) <= 1:
             conviction_adjustment += 1.0
             if mode == "neutral":
@@ -403,7 +415,6 @@ def compute_learning_adjustment(recent_decisions: List[dict]) -> LearningAdjustm
     # -----------------------------------------------------------
     # C) Global caps / sanity
     # -----------------------------------------------------------
-    # Bounded but not too tight (lets it express adaptation).
     stake_multiplier = max(0.72, min(1.32, stake_multiplier))
     conviction_adjustment = max(-5.0, min(6.0, conviction_adjustment))
 

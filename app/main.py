@@ -126,6 +126,71 @@ class BotApp:
         snap.daily_pnl_dollars = 0.0
         return snap
 
+    def _fetch_market_universe(self, pages: int = 5, page_limit: int = 100) -> list[dict]:
+        """
+        Fetch multiple pages of markets and filter out low-quality universe members
+        before _choose_market() ranking.
+
+        Notes:
+        - Requires KalshiClient.get_markets(..., cursor=...) support.
+        - We intentionally filter out provisional + MVE combo markets because they have
+          dominated page-1 results in practice and frequently have unusable quotes.
+        """
+        all_markets: list[dict] = []
+        cursor: Optional[str] = None
+
+        total_seen = 0
+        dropped_mve = 0
+        dropped_provisional = 0
+        pages_fetched = 0
+
+        for _ in range(max(1, int(pages))):
+            try:
+                # Backward compatibility: if client hasn't been patched for cursor yet,
+                # this will raise TypeError and we'll fall back to single-page behavior.
+                raw = self.client.get_markets(limit=page_limit, cursor=cursor)
+            except TypeError:
+                raw = self.client.get_markets(limit=page_limit)
+
+            page_markets = extract_markets(raw)
+            pages_fetched += 1
+
+            if not page_markets:
+                break
+
+            total_seen += len(page_markets)
+
+            for m in page_markets:
+                ticker = str(m.get("ticker", "") or "")
+                is_mve = ticker.startswith("KXMVESPORTSMULTIGAMEEXTENDED") or bool(m.get("mve_collection_ticker"))
+                is_provisional = bool(m.get("is_provisional"))
+
+                if is_mve:
+                    dropped_mve += 1
+                    continue
+                if is_provisional:
+                    dropped_provisional += 1
+                    continue
+
+                all_markets.append(m)
+
+            # Stop if no pagination cursor exists (or raw isn't dict-like)
+            if not isinstance(raw, dict):
+                break
+            cursor = raw.get("cursor")
+            if not cursor:
+                break
+
+        self.logger.info(
+            "Universe fetch | seen=%s kept=%s dropped_mve=%s dropped_provisional=%s pages=%s",
+            total_seen,
+            len(all_markets),
+            dropped_mve,
+            dropped_provisional,
+            pages_fetched,
+        )
+        return all_markets
+
     def _choose_market(self, markets: list[dict]) -> Any:
         candidates = []
         for m in markets[:200]:
@@ -450,9 +515,17 @@ class BotApp:
         self._tick_count += 1
         now = dt.datetime.now(dt.UTC).isoformat()
 
-        raw = self.client.get_markets(limit=100)
-        markets = extract_markets(raw)
-        self.logger.info(f"Fetched markets: {len(markets)}")
+        # Preferred path: broader + cleaner universe
+        markets = self._fetch_market_universe(pages=5, page_limit=100)
+        self.logger.info(f"Fetched filtered market universe: {len(markets)}")
+
+        # Fallback path: preserve old behavior if filtered universe is empty
+        if not markets:
+            self.logger.warning("Filtered universe empty; falling back to single-page raw markets.")
+            raw = self.client.get_markets(limit=100)
+            markets = extract_markets(raw)
+            self.logger.info(f"Fetched markets (fallback raw): {len(markets)}")
+
         if not markets:
             return
 

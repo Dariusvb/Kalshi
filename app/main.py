@@ -100,6 +100,20 @@ class BotApp:
         self._pipeline_test_entries_sent = 0
         self._pipeline_test_last_entry_tick: Optional[int] = None
 
+        # -----------------------------
+        # Patch 2: NewsCache wiring (uses your app/news_cache.py class)
+        # -----------------------------
+        self.news_cache = None
+        try:
+            import os
+            from app.news_cache import NewsCache
+
+            # Store cache next to the DB file, so it persists on the same volume.
+            cache_path = os.path.join(os.path.dirname(self.settings.DB_PATH), "news_cache.json")
+            self.news_cache = NewsCache(path=cache_path, ttl_seconds=6 * 3600)
+        except Exception:
+            self.news_cache = None
+
     def shutdown(self) -> None:
         self._stopping = True
         try:
@@ -1163,7 +1177,7 @@ class BotApp:
         Real news adapter:
         - builds query from market label/title/question
         - fetches items via app/news_fetch.py
-        - (optional) uses app/news_cache.py if present
+        - uses self.news_cache (your NewsCache class) if available
         - infers direction_hint + strength so evaluate_news_signal() can work
         """
         # ---- Import news_fetch (required for this path) ----
@@ -1175,9 +1189,71 @@ class BotApp:
                 yes_means_event_occurs,
             )
         except Exception as e:
-            if self.logger:
-                self.logger.warning(f"News fetch module unavailable: {e}")
+            self.logger.warning(f"News fetch module unavailable: {e}")
             return []
+
+        # ---- Choose the best label we have ----
+        label = str(
+            chosen.get("market_label")
+            or chosen.get("title")
+            or chosen.get("question")
+            or chosen.get("name")
+            or ""
+        ).strip()
+
+        if not label:
+            label = str(chosen.get("ticker") or "").strip()
+        if not label:
+            return []
+
+        # ---- Build query ----
+        query = build_news_query_from_market_label(label)
+        if not query:
+            return []
+        
+        # ✅ One-liner log (paste-over requested)
+        self.logger.info(f"News query='{query}' | label='{label[:120]}' | ticker={chosen.get('ticker')}")
+        
+        # ---- Cache (your NewsCache: seen_recently/mark_seen) ----
+        cache = getattr(self, "news_cache", None)
+
+        # ---- Fetch RSS ----
+        raw_items = fetch_google_news_rss(query, max_items=12, timeout=6.0)
+        if not raw_items:
+            return []
+
+        # ---- Infer YES/NO meaning from wording & add direction_hint/strength ----
+        y_is_event = yes_means_event_occurs(label)
+
+        out: list[dict] = []
+        for it in raw_items:
+            if not isinstance(it, dict):
+                continue
+
+            # If we have a cache, skip items we've already processed recently
+            if cache is not None:
+                try:
+                    if cache.seen_recently(it):
+                        continue
+                except Exception:
+                    pass
+
+            # Add direction_hint/strength (best effort)
+            try:
+                enriched = infer_direction_hint(it, yes_means_event_occurs=y_is_event)
+            except Exception:
+                enriched = it
+
+            out.append(enriched)
+
+            # Mark as seen after accepting
+            if cache is not None:
+                try:
+                    cache.mark_seen(it)
+                except Exception:
+                    pass
+
+        return out
 
         # ---- Optional cache adapter (best-effort; safe if missing) ----
         cache_get = None

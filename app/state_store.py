@@ -82,7 +82,7 @@ class StateStore:
         self._ensure_column("decisions", "news_score", "REAL", None)
         self._ensure_column("decisions", "news_confidence", "REAL", None)
         self._ensure_column("decisions", "news_regime", "TEXT", None)
-        self._ensure_column("decisions", "news_effective_score", "REAL", None)  # <-- added
+        self._ensure_column("decisions", "news_effective_score", "REAL", None)
         self._ensure_column("decisions", "spread_cents", "INTEGER", None)
 
         # Helpful indexes
@@ -94,7 +94,6 @@ class StateStore:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_decisions_resolved_ts ON decisions(resolved_ts)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_decisions_market_category ON decisions(market_category)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_decisions_news_regime ON decisions(news_regime)")
-        # Optional but useful for later analytics/backtests
         cur.execute("CREATE INDEX IF NOT EXISTS idx_decisions_news_effective_score ON decisions(news_effective_score)")
         self.conn.commit()
 
@@ -130,7 +129,7 @@ class StateStore:
             self._maybe_float(row.get("news_score")),
             self._maybe_float(row.get("news_confidence")),
             row.get("news_regime"),
-            self._maybe_float(row.get("news_effective_score")),  # <-- added
+            self._maybe_float(row.get("news_effective_score")),
             self._maybe_int(row.get("spread_cents")),
         ))
         self.conn.commit()
@@ -182,6 +181,86 @@ class StateStore:
             return 0
 
         sql = f"UPDATE decisions SET {', '.join(updates)} "
+
+        if decision_id is not None:
+            sql += "WHERE id = ?"
+            params.append(int(decision_id))
+        else:
+            sql += "WHERE ticker = ? AND ts = ?"
+            params.extend([ticker, ts])
+
+        cur = self.conn.cursor()
+        cur.execute(sql, params)
+        self.conn.commit()
+        return int(cur.rowcount)
+
+    def update_decision_metadata(
+        self,
+        *,
+        decision_id: Optional[int] = None,
+        ticker: Optional[str] = None,
+        ts: Optional[str] = None,
+        updates: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """
+        Generic metadata updater for decision rows (partial updates).
+
+        Preferred targeting:
+            decision_id=...
+
+        Fallback targeting (less precise):
+            ticker + ts
+
+        Uses a field allowlist to prevent accidental updates to core immutable fields.
+        """
+        if decision_id is None and not (ticker and ts):
+            raise ValueError("Provide decision_id OR (ticker and ts) to update metadata")
+
+        if not updates:
+            return 0
+
+        allowed_fields = {
+            # audit/meta fields
+            "reasons",
+            "market_category",
+            # news fields
+            "news_score",
+            "news_confidence",
+            "news_regime",
+            "news_effective_score",
+            # setup diagnostics
+            "spread_cents",
+            # optional convenience outcome fields (outcome updater still preferred)
+            "realized_pnl",
+            "won",
+            "resolved_ts",
+        }
+
+        set_clauses: list[str] = []
+        params: list[Any] = []
+
+        for key, value in updates.items():
+            if key not in allowed_fields:
+                continue
+
+            if key in {"news_score", "news_confidence", "news_effective_score", "realized_pnl"}:
+                set_clauses.append(f"{key} = ?")
+                params.append(self._maybe_float(value))
+            elif key == "spread_cents":
+                set_clauses.append(f"{key} = ?")
+                params.append(self._maybe_int(value))
+            elif key == "won":
+                set_clauses.append(f"{key} = ?")
+                params.append(self._normalize_won(value) if value is not None else None)
+            else:
+                # reasons, market_category, news_regime, resolved_ts
+                set_clauses.append(f"{key} = ?")
+                params.append(value)
+
+        if not set_clauses:
+            return 0
+
+        sql = f"UPDATE decisions SET {', '.join(set_clauses)} "
 
         if decision_id is not None:
             sql += "WHERE id = ?"

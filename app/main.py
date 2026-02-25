@@ -11,6 +11,7 @@ from app.execution_engine import build_limit_order_from_signal
 from app.kalshi_client import KalshiClient, KalshiAPIError
 from app.logger import get_logger
 from app.market_data import extract_markets, summarize_market
+from app.paper_resolver import resolve_paper_trades
 from app.performance import summarize_decisions
 from app.portfolio_tracker import PortfolioSnapshot, parse_balance_payload
 from app.risk_engine import evaluate_risk
@@ -43,6 +44,11 @@ class BotApp:
         self._stopping = False
         self._tick_count = 0
         self._last_summary_sent_minute = None
+
+        # Paper trade resolver settings (MVP defaults; move to Settings later if you want)
+        self.paper_resolver_enabled = True
+        self.paper_resolver_min_age_minutes = 15
+        self.paper_resolver_max_to_check = 25
 
     def shutdown(self) -> None:
         self._stopping = True
@@ -146,8 +152,7 @@ class BotApp:
     def _mode_stats_from_decisions(self, decisions: list[dict]) -> dict:
         """
         Splits stats for simulated vs live decisions.
-        If future rows include realized_pnl / won, we will display them.
-        For current MVP rows, win/loss may be unavailable (reported as n/a).
+        If rows include realized_pnl / won / resolved_ts, those will show.
         """
         def summarize_mode(rows: list[dict]) -> dict:
             total = len(rows)
@@ -158,25 +163,28 @@ class BotApp:
             avg_conv = round(sum(float(r.get("final_conviction", 0.0)) for r in rows) / total, 2) if total else 0.0
             avg_stake = round(sum(float(r.get("stake_dollars", 0.0)) for r in trades) / len(trades), 2) if trades else 0.0
 
-            # Optional future compatibility if you add realized_pnl / won columns into stored decisions
-            pnl_values = [r.get("realized_pnl") for r in trades if r.get("realized_pnl") is not None]
-            wins = [r for r in trades if r.get("won") is True or r.get("won") == 1]
-            losses = [r for r in trades if r.get("won") is False or r.get("won") == 0]
+            resolved = [r for r in trades if r.get("resolved_ts") is not None]
+            pnl_values = [r.get("realized_pnl") for r in resolved if r.get("realized_pnl") is not None]
+            wins = [r for r in resolved if r.get("won") is True or r.get("won") == 1]
+            losses = [r for r in resolved if r.get("won") is False or r.get("won") == 0]
 
             pnl_total = round(sum(float(x) for x in pnl_values), 2) if pnl_values else None
             win_rate = round((len(wins) / (len(wins) + len(losses))) * 100.0, 1) if (wins or losses) else None
+            expectancy = round((sum(float(x) for x in pnl_values) / len(pnl_values)), 4) if pnl_values else None
 
             return {
                 "count": total,
                 "trades": len(trades),
                 "skips": len(skips),
                 "errors": len(errors),
+                "resolved_trades": len(resolved),
                 "avg_conviction": avg_conv,
                 "avg_stake": avg_stake,
                 "wins": len(wins),
                 "losses": len(losses),
-                "win_rate": win_rate,     # None => not available yet
-                "pnl_total": pnl_total,   # None => not available yet
+                "win_rate": win_rate,
+                "pnl_total": pnl_total,
+                "expectancy": expectancy,
             }
 
         sim_rows = [d for d in decisions if bool(d.get("dry_run", True))]
@@ -208,9 +216,10 @@ class BotApp:
                 else "W/L n/a"
             )
             pnl = f"PnL ${m['pnl_total']:.2f}" if m["pnl_total"] is not None else "PnL n/a"
+            exp = f"Exp ${m['expectancy']:.4f}" if m["expectancy"] is not None else "Exp n/a"
             return (
-                f"{name}: trades={m['trades']} skips={m['skips']} errors={m['errors']} "
-                f"avg_conv={m['avg_conviction']:.1f} avg_stake=${m['avg_stake']:.2f} {wl} {pnl}"
+                f"{name}: trades={m['trades']} resolved={m['resolved_trades']} skips={m['skips']} errors={m['errors']} "
+                f"avg_conv={m['avg_conviction']:.1f} avg_stake=${m['avg_stake']:.2f} {wl} {pnl} {exp}"
             )
 
         msg = (
@@ -246,7 +255,7 @@ class BotApp:
             f"| spread={chosen['spread_cents']} | vol={chosen['volume']}"
         )
 
-        # recent history for adaptive logic (works in DRY_RUN, but only proxy-based unless outcomes are logged)
+        # recent history for adaptive logic (works in DRY_RUN; becomes real learning once outcomes are logged)
         recent_for_learning = self.store.recent_decisions(30)
         learning = self._compute_learning(recent_for_learning)
 
@@ -305,6 +314,13 @@ class BotApp:
 
         if sig.direction != "SKIP" and risk.allowed:
             order = build_limit_order_from_signal(chosen["ticker"], sig.direction, chosen, risk.stake_dollars)
+
+            # Store exact simulated/live intended entry for better paper PnL tracking later
+            try:
+                reasons.append(f"entry_price_cents:{int(order['price_cents'])}")
+            except Exception:
+                pass
+
             try:
                 order_resp = self.client.place_order(
                     ticker=order["ticker"],
@@ -337,7 +353,7 @@ class BotApp:
                 f"| risk={risk.reason}"
             )
 
-        # Store auditable decision row
+        # Store auditable decision row (outcome fields start null and get updated later)
         row = {
             "ts": now,
             "ticker": chosen["ticker"],
@@ -349,13 +365,29 @@ class BotApp:
             "action": action,
             "reasons": ";".join(reasons),
             "dry_run": self.settings.DRY_RUN,
+            "realized_pnl": None,
+            "won": None,
+            "resolved_ts": None,
+            "market_category": chosen.get("category"),
         }
+        inserted_id = self.store.insert_decision(row)
 
-        # Optional future outcome fields if you later add them to StateStore schema/insert method
-        # row["won"] = None
-        # row["realized_pnl"] = None
-
-        self.store.insert_decision(row)
+        # Resolve older DRY_RUN trades into paper outcomes so summaries/learning can use W/L + PnL
+        if self.settings.DRY_RUN and self.paper_resolver_enabled:
+            try:
+                rr = resolve_paper_trades(
+                    store=self.store,
+                    client=self.client,
+                    logger=self.logger,
+                    max_to_check=self.paper_resolver_max_to_check,
+                    min_age_minutes=self.paper_resolver_min_age_minutes,
+                )
+                if rr.updated > 0:
+                    self.logger.info(
+                        f"Paper resolver updated={rr.updated} checked={rr.checked} skipped={rr.skipped}"
+                    )
+            except Exception as e:
+                self.logger.warning(f"Paper resolver failed: {e}")
 
         # local logs
         recent = self.store.recent_decisions(20)

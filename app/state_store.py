@@ -42,7 +42,7 @@ class StateStore:
     def _init_db(self) -> None:
         cur = self.conn.cursor()
 
-        # Core decisions table
+        # Core decisions table (original base schema)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS decisions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -72,11 +72,17 @@ class StateStore:
 
         self.conn.commit()
 
-        # ---- Backward-compatible schema migrations for "real learning" fields ----
+        # ---- Backward-compatible schema migrations for outcome/learning fields ----
         self._ensure_column("decisions", "realized_pnl", "REAL", None)
         self._ensure_column("decisions", "won", "INTEGER", None)          # 1 / 0 / NULL
         self._ensure_column("decisions", "resolved_ts", "TEXT", None)
         self._ensure_column("decisions", "market_category", "TEXT", None)
+
+        # ---- New fields for news/trend scoring and setup diagnostics ----
+        self._ensure_column("decisions", "news_score", "REAL", None)
+        self._ensure_column("decisions", "news_confidence", "REAL", None)
+        self._ensure_column("decisions", "news_regime", "TEXT", None)
+        self._ensure_column("decisions", "spread_cents", "INTEGER", None)
 
         # Helpful indexes
         cur = self.conn.cursor()
@@ -86,35 +92,42 @@ class StateStore:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_decisions_dry_run ON decisions(dry_run)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_decisions_resolved_ts ON decisions(resolved_ts)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_decisions_market_category ON decisions(market_category)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_decisions_news_regime ON decisions(news_regime)")
         self.conn.commit()
 
     def insert_decision(self, row: Dict[str, Any]) -> int:
         """
         Inserts a decision row.
-        Supports both old and new fields. Returns inserted decision id.
+        Supports original fields plus outcome/news fields.
+        Returns inserted decision id.
         """
         cur = self.conn.cursor()
         cur.execute("""
             INSERT INTO decisions (
                 ts, ticker, direction, base_conviction, social_bonus, final_conviction,
                 stake_dollars, action, reasons, dry_run,
-                realized_pnl, won, resolved_ts, market_category
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                realized_pnl, won, resolved_ts, market_category,
+                news_score, news_confidence, news_regime, spread_cents
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             row["ts"],
             row["ticker"],
             row["direction"],
-            row["base_conviction"],
-            row["social_bonus"],
-            row["final_conviction"],
-            row["stake_dollars"],
+            float(row["base_conviction"]),
+            float(row["social_bonus"]),
+            float(row["final_conviction"]),
+            float(row["stake_dollars"]),
             row["action"],
             row.get("reasons", ""),
             1 if row.get("dry_run", True) else 0,
-            row.get("realized_pnl"),
+            self._maybe_float(row.get("realized_pnl")),
             self._normalize_won(row.get("won")),
             row.get("resolved_ts"),
             row.get("market_category"),
+            self._maybe_float(row.get("news_score")),
+            self._maybe_float(row.get("news_confidence")),
+            row.get("news_regime"),
+            self._maybe_int(row.get("spread_cents")),
         ))
         self.conn.commit()
         return int(cur.lastrowid)
@@ -214,7 +227,7 @@ class StateStore:
 
     def unresolved_trade_decisions(self, limit: int = 100, dry_run: Optional[bool] = None) -> List[dict]:
         """
-        Trade decisions that have not yet been resolved. Useful for future paper-trade resolver.
+        Trade decisions that have not yet been resolved. Useful for paper-trade resolver.
         """
         cur = self.conn.cursor()
 
@@ -337,6 +350,22 @@ class StateStore:
             if v in {"0", "false", "loss", "lost", "no"}:
                 return 0
         raise ValueError(f"Invalid won value: {value!r}")
+
+    def _maybe_float(self, value: Any) -> Optional[float]:
+        if value is None or value == "":
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _maybe_int(self, value: Any) -> Optional[int]:
+        if value is None or value == "":
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
     def close(self) -> None:
         self.conn.close()

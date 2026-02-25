@@ -39,9 +39,11 @@ def _as_dollars_from_maybe_cents(value: float, *, force_cents: bool = False) -> 
     if force_cents:
         return round(value / 100.0, 2)
 
-    # Heuristic: values above 10,000 are more likely cents than dollars
-    # (10,001 dollars cash is possible, but this is a best-effort fallback)
-    if abs(value) > 10000:
+    # Heuristic: values at or above 10,000 are more likely cents than dollars
+    # (10,000 cents = $100). This avoids misreading a $100 deposit as $10,000.
+    # Note: a true $10,000 cash balance could be misclassified by this fallback,
+    # but explicit *_cents keys should be preferred when available.
+    if abs(value) >= 10000:
         return round(value / 100.0, 2)
 
     return round(value, 2)

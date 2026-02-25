@@ -37,6 +37,9 @@ class Settings:
     KALSHI_PRIVATE_KEY_PEM: str = os.getenv("KALSHI_PRIVATE_KEY_PEM", "")
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
 
+    # Optional explicit override for debugging / future API host changes
+    KALSHI_BASE_URL: str = os.getenv("KALSHI_BASE_URL", "").strip()
+
     # tuning
     SCAN_INTERVAL_SECONDS: int = _int("SCAN_INTERVAL_SECONDS", 60)
     MIN_TRADE_DOLLARS: int = _int("MIN_TRADE_DOLLARS", 10)
@@ -59,8 +62,19 @@ class Settings:
 
     @property
     def base_url(self) -> str:
-        # Kalshi quickstart examples use demo-api.kalshi.co and api.kalshi.com
-        return "https://demo-api.kalshi.co" if self.KALSHI_ENV == "demo" else "https://api.elections.kalshi.com"
+        # Highest priority: explicit override (great for Render debugging)
+        if self.KALSHI_BASE_URL:
+            return self.KALSHI_BASE_URL.rstrip("/")
+
+        env = self.KALSHI_ENV.strip().lower()
+        if env == "demo":
+            return "https://demo-api.kalshi.co"
+        if env in {"prod", "production"}:
+            # Current documented production host
+            return "https://api.elections.kalshi.com"
+
+        # Fail loud instead of silently pointing to wrong host
+        raise ValueError(f"Unsupported KALSHI_ENV={self.KALSHI_ENV!r}; use demo or prod")
 
     def validate(self) -> None:
         if not self.KALSHI_API_KEY_ID:

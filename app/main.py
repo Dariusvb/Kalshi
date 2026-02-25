@@ -82,21 +82,32 @@ class BotApp:
         return snap
 
     def _choose_market(self, markets: list[dict]) -> Any:
-        candidates = []
-        for m in markets[:100]:
-            s = summarize_market(m)
-            if s["status"].lower() not in {"active", "open", "trading", "unknown"}:
-                continue
-            if s["spread_cents"] <= 0:
-                continue
-            candidates.append(s)
+    candidates = []
+    for m in markets[:200]:
+        s = summarize_market(m)
 
-        # prioritize tighter spread + some volume
-        candidates.sort(key=lambda x: (x["spread_cents"], -x["volume"]))
-        return candidates[0] if candidates else None
+        if s["status"].lower() not in {"active", "open", "trading", "unknown"}:
+            continue
 
+        # basic quality filters
+        if s["spread_cents"] <= 0 or s["spread_cents"] > self.settings.MAX_SPREAD_CENTS:
+            continue
+        if s["volume"] < self.settings.MIN_RECENT_VOLUME:
+            continue
+
+        # avoid ultra-extreme dead zones for MVP strategy
+        mid = s["mid_yes_cents"]
+        if mid <= 2 or mid >= 98:
+            continue
+
+        candidates.append(s)
+
+    # prioritize good spread + healthy volume + non-extreme pricing
+    candidates.sort(key=lambda x: (x["spread_cents"], abs(x["mid_yes_cents"] - 50), -x["volume"]))
+    return candidates[0] if candidates else None
+    
     def tick(self) -> None:
-        now = dt.datetime.utcnow().isoformat()
+        now = dt.datetime.now(dt.UTC).isoformat()
         raw = self.client.get_markets(limit=100)
         markets = extract_markets(raw)
         self.logger.info(f"Fetched markets: {len(markets)}")

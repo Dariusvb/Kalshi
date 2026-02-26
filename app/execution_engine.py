@@ -33,12 +33,29 @@ def _clamp_price_cents(x: float) -> int:
 def cents_to_contract_count(stake_dollars: float, price_cents: int) -> int:
     """
     Rough count sizing for binary contracts (BUY side).
-    stake_dollars ~ max risk on BUY side at price cents.
+    stake_dollars ~ max risk (premium paid) on BUY side at price_cents.
+
+    Fix: prevent "oversize" (or surprise trades) when stake_dollars <= 0 by returning 0.
+    Previously stake_dollars=0 would still return 1 contract due to max(1, ...).
     """
-    if price_cents <= 0:
+    try:
+        px = int(price_cents)
+    except Exception:
         return 0
-    stake_cents = int(round(float(stake_dollars) * 100.0))
-    return max(1, stake_cents // int(price_cents))
+
+    if px <= 0:
+        return 0
+
+    # Fix oversize / surprise 1-contract trades when stake is zero/negative.
+    stake = float(stake_dollars or 0.0)
+    if stake <= 0.0:
+        return 0
+
+    stake_cents = int(round(stake * 100.0))
+    if stake_cents <= 0:
+        return 0
+
+    return max(1, stake_cents // px)
 
 
 def _infer_no_quotes_from_yes(yes_bid: float, yes_ask: float) -> Tuple[Optional[float], Optional[float]]:

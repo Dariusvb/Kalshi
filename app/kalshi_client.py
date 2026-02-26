@@ -245,37 +245,63 @@ class KalshiClient:
         order_type: str = "limit",
     ) -> Any:
         """
-        side / yes_no names may need adjustment to exact schema fields from current docs.
-        DRY_RUN-safe. Validates inputs before simulating.
+        DRY_RUN-safe. Validates inputs before simulating/sending.
+        Compatibility patch:
+        - Accepts yes_no in {"YES","NO","yes","no"} and normalizes.
+        - Accepts side in any case and normalizes.
+        - Keeps request body consistent so main.py + execution_engine can pass lower/upper safely.
         """
         if not ticker:
             raise ValueError("ticker is required")
         if not client_order_id:
             raise ValueError("client_order_id is required")
-        if order_type.lower() != "limit":
+        if str(order_type or "").lower() != "limit":
             raise ValueError("Only limit orders are supported in this MVP")
-        if int(count) <= 0:
+
+        try:
+            n_count = int(count)
+        except Exception:
+            raise ValueError("count must be an int")
+        if n_count <= 0:
             raise ValueError("count must be > 0")
-        if not (1 <= int(price_cents) <= 99):
+
+        try:
+            n_price = int(price_cents)
+        except Exception:
+            raise ValueError("price_cents must be an int")
+        if not (1 <= n_price <= 99):
             raise ValueError("price_cents must be between 1 and 99")
-        if side.lower() not in {"buy", "sell"}:
+
+        s_side = str(side or "").strip().lower()
+        if s_side not in {"buy", "sell"}:
             raise ValueError("side must be buy or sell")
-        if yes_no.upper() not in {"YES", "NO"}:
-            raise ValueError("yes_no must be YES or NO")
+
+        # --- PATCH: accept yes/no in any case, normalize robustly ---
+        s_yesno_raw = str(yes_no or "").strip()
+        s_yesno = s_yesno_raw.upper()
+        if s_yesno in {"Y"}:
+            s_yesno = "YES"
+        elif s_yesno in {"N"}:
+            s_yesno = "NO"
+        if s_yesno not in {"YES", "NO"}:
+            raise ValueError("yes_no must be YES or NO (case-insensitive)")
 
         body = {
-            "ticker": ticker,
-            "side": side.lower(),
-            "yes_no": yes_no.upper(),
-            "count": int(count),
-            "price": int(price_cents),
+            "ticker": str(ticker).strip(),
+            "side": s_side,                 # "buy" / "sell"
+            "yes_no": s_yesno,              # "YES" / "NO" (normalized)
+            "count": n_count,
+            "price": n_price,
             "type": "limit",
-            "client_order_id": client_order_id,
+            "client_order_id": str(client_order_id).strip(),
         }
 
         if self.dry_run:
             if self.logger:
-                self.logger.info(f"DRY_RUN place_order simulated for {ticker} {yes_no.upper()} {side.lower()}")
+                self.logger.info(
+                    f"DRY_RUN place_order simulated | {body['ticker']} {body['yes_no']} {body['side']} "
+                    f"count={body['count']} px={body['price']}c"
+                )
             return {
                 "dry_run": True,
                 "simulated": True,

@@ -1012,10 +1012,10 @@ class BotApp:
             float(self.settings.MAX_SPREAD_CENTS) + 5.0,
         )
 
-        # Guardrail to reduce repeated selection of ultra-extreme MVE tails (e.g., 3c / 97c)
-        # Keep this only in relaxed mode so strict behavior remains unchanged.
-        relaxed_mid_floor = 8.0
-        relaxed_mid_ceiling = 92.0
+        # Prefer higher-probability markets; avoid ultra-cheap tails.
+        # Keep aligned with signal_engine YES/NO floors (default 15c).
+        relaxed_mid_floor = 15.0
+        relaxed_mid_ceiling = 85.0
 
         for m in markets[:200]:
             try:

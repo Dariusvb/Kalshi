@@ -1255,83 +1255,6 @@ class BotApp:
 
         return out
 
-        # ---- Optional cache adapter (best-effort; safe if missing) ----
-        cache_get = None
-        cache_set = None
-        try:
-            # Support a few common function names without forcing your cache API.
-            import app.news_cache as nc  # type: ignore
-
-            cache_get = getattr(nc, "get_cached_news_items", None) or getattr(nc, "cache_get", None)
-            cache_set = getattr(nc, "set_cached_news_items", None) or getattr(nc, "cache_set", None)
-        except Exception:
-            cache_get = None
-            cache_set = None
-
-        # ---- Choose the best label we have ----
-        label = str(
-            chosen.get("market_label")
-            or chosen.get("title")
-            or chosen.get("question")
-            or chosen.get("name")
-            or ""
-        ).strip()
-
-        if not label:
-            # last resort: ticker-based query (usually weak)
-            label = str(chosen.get("ticker") or "").strip()
-
-        if not label:
-            return []
-
-        # ---- Build query ----
-        query = build_news_query_from_market_label(label)
-        if not query:
-            return []
-
-        # ---- Cache lookup ----
-        cached: list[dict] = []
-        if callable(cache_get):
-            try:
-                # allow either cache_get(key) or cache_get(key, ttl_seconds=?)
-                try:
-                    cached = cache_get(query)  # type: ignore[misc]
-                except TypeError:
-                    cached = cache_get(query, 120)  # type: ignore[misc]
-                if isinstance(cached, list) and cached:
-                    return cached
-            except Exception as e:
-                if self.logger:
-                    self.logger.warning(f"News cache get failed (continuing): {e}")
-
-        # ---- Fetch RSS ----
-        items = fetch_google_news_rss(query, max_items=12, timeout=6.0)
-        if not items:
-            return []
-
-        # ---- Infer YES/NO meaning from wording & add direction_hint/strength ----
-        y_is_event = yes_means_event_occurs(label)
-        out: list[dict] = []
-        for it in items:
-            try:
-                out.append(infer_direction_hint(it, yes_means_event_occurs=y_is_event))
-            except Exception:
-                out.append(it)
-
-        # ---- Cache store ----
-        if callable(cache_set):
-            try:
-                # allow either cache_set(key, items) or cache_set(key, items, ttl_seconds=?)
-                try:
-                    cache_set(query, out)  # type: ignore[misc]
-                except TypeError:
-                    cache_set(query, out, 120)  # type: ignore[misc]
-            except Exception as e:
-                if self.logger:
-                    self.logger.warning(f"News cache set failed (continuing): {e}")
-
-        return out
-
     def _compute_news_signal(self, chosen: dict) -> dict:
         if not self.news_signal_enabled or evaluate_news_signal is None:
             return {
@@ -1555,9 +1478,12 @@ class BotApp:
         if not market_label:
             market_label = str(chosen.get("ticker") or "")
 
+        mid_yes = float(chosen.get("mid_yes_cents", 0.0) or 0.0)
+        mid_no = 100.0 - mid_yes if mid_yes else 0.0
+
         self.logger.info(
-            f"Candidate {chosen['ticker']} | mid={chosen['mid_yes_cents']:.1f} "
-            f"| spread={chosen['spread_cents']} | vol={chosen['volume']}"
+            f"Candidate {chosen['ticker']} | mid_yes={mid_yes:.1f} mid_no={mid_no:.1f} "
+            f"| spread={chosen.get('spread_cents')} | vol={chosen.get('volume')} | pick={chosen.get('_pick_mode','')}"
         )
 
         recent_for_learning = self.store.recent_decisions(80)
@@ -1683,6 +1609,14 @@ class BotApp:
             f"news_dir_scale:{float(news_applied.get('news_direction_scale', 0.0)):.2f}",
             f"news_conflict_sig:{1 if news_applied.get('news_conflicts_signal') else 0}",
         ]
+        
+        # Helpful always-on diagnostics for direction bias
+        try:
+            my = float(chosen.get("mid_yes_cents", 0.0) or 0.0)
+            reasons.append(f"mid_yes_cents:{my:.2f}")
+            reasons.append(f"mid_no_cents:{(100.0-my):.2f}")
+        except Exception:
+            pass
 
         if market_label:
             reasons.append(f"market_label:{market_label[:140]}")

@@ -32,12 +32,20 @@ def _clamp_price_cents(x: float) -> int:
 
 def cents_to_contract_count(stake_dollars: float, price_cents: int) -> int:
     """
-    Rough count sizing for binary contracts (BUY side).
-    stake_dollars ~ max risk (premium paid) on BUY side at price_cents.
+    Count sizing for binary contracts (BUY side).
 
-    Fix: prevent "oversize" (or surprise trades) when stake_dollars <= 0 by returning 0.
-    Previously stake_dollars=0 would still return 1 contract due to max(1, ...).
+    FIX: oversize bug / phantom trades
+    - If stake_dollars <= 0 -> return 0 (do not force a 1-contract trade).
+    - If price invalid -> return 0.
     """
+    try:
+        stake = float(stake_dollars)
+    except Exception:
+        return 0
+
+    if stake <= 0:
+        return 0
+
     try:
         px = int(price_cents)
     except Exception:
@@ -46,26 +54,17 @@ def cents_to_contract_count(stake_dollars: float, price_cents: int) -> int:
     if px <= 0:
         return 0
 
-    # Fix oversize / surprise 1-contract trades when stake is zero/negative.
-    stake = float(stake_dollars or 0.0)
-    if stake <= 0.0:
-        return 0
-
     stake_cents = int(round(stake * 100.0))
-    if stake_cents <= 0:
-        return 0
-
-    return max(1, stake_cents // px)
+    # floor division is correct risk approximation; do NOT force >= 1
+    cnt = stake_cents // px
+    return max(0, int(cnt))
 
 
 def _infer_no_quotes_from_yes(yes_bid: float, yes_ask: float) -> Tuple[Optional[float], Optional[float]]:
     """
-    If explicit NO bid/ask aren't present, infer from YES quotes using complements:
-
+    Infer NO bid/ask from YES using complements:
       no_ask ≈ 100 - yes_bid
       no_bid ≈ 100 - yes_ask
-
-    This is a common complement relationship for binary markets.
     """
     no_ask = None
     no_bid = None
@@ -105,8 +104,7 @@ def _best_prices_for_side(market: dict) -> dict:
         if no_ask <= 0 and inf_no_ask is not None:
             no_ask = float(inf_no_ask)
 
-    # If YES quotes are missing but NO quotes exist, we can infer YES too
-    # (symmetry: yes_ask ≈ 100 - no_bid, yes_bid ≈ 100 - no_ask)
+    # If YES quotes are missing but NO quotes exist, infer YES too
     if (yes_bid <= 0 and yes_ask <= 0) and (no_bid > 0 or no_ask > 0):
         if yes_ask <= 0 and no_bid > 0:
             yes_ask = 100.0 - float(no_bid)
@@ -133,13 +131,12 @@ def _best_prices_for_side(market: dict) -> dict:
 
 def build_limit_order_from_signal(ticker: str, direction: str, market: dict, stake_dollars: float) -> dict:
     """
-    Build a BUY limit order for YES or NO that is compatible with main.py.
+    Build a BUY limit order for YES or NO compatible with main.py + KalshiClient.
 
-    Key behavior:
-    - Returns yes_no as lowercase ("yes"/"no") to match main.py + KalshiClient usage.
-    - Uses the best available side-specific ask for entry (buying crosses to ask).
-    - Robust to missing no_bid/no_ask by inferring from yes_bid/yes_ask (and vice versa).
-    - Safe fallback to mid when quotes are missing.
+    - yes_no returned lowercase: "yes" / "no"
+    - Uses best ask for entry when available
+    - Robust inference when NO quotes missing
+    - FIX: if stake<=0 -> count=0 (caller should treat as SKIP / no-op)
     """
     d = str(direction or "").strip().upper()
     if d not in {"YES", "NO"}:
@@ -155,7 +152,6 @@ def build_limit_order_from_signal(ticker: str, direction: str, market: dict, sta
     side = "buy"
 
     if d == "YES":
-        # Prefer crossing to best displayed YES ask; fallback to mid; final fallback to (bid+1) if bid exists.
         if yes_ask > 0:
             price = _clamp_price_cents(yes_ask)
         elif mid_yes > 0:
@@ -165,13 +161,10 @@ def build_limit_order_from_signal(ticker: str, direction: str, market: dict, sta
         else:
             price = 50
         yes_no = "yes"
-
-    else:  # d == "NO"
-        # Prefer crossing to best displayed NO ask; fallback via complements; then fallback to inferred no-mid.
+    else:
         if no_ask > 0:
             price = _clamp_price_cents(no_ask)
         elif yes_bid > 0:
-            # no_ask ≈ 100 - yes_bid
             price = _clamp_price_cents(100.0 - yes_bid)
         elif mid_yes > 0:
             price = _clamp_price_cents(100.0 - mid_yes)
@@ -186,7 +179,7 @@ def build_limit_order_from_signal(ticker: str, direction: str, market: dict, sta
     return {
         "ticker": str(ticker),
         "side": side,
-        "yes_no": yes_no,  # IMPORTANT: lowercase for main.py / client.place_order
+        "yes_no": yes_no,
         "count": int(count),
         "price_cents": int(price),
         "client_order_id": gen_client_id("kalshi"),

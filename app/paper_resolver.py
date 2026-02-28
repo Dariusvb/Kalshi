@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import datetime as dt
+import re
+import sqlite3
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -14,57 +16,146 @@ class PaperResolutionResult:
     skipped: int
 
 
+# Backward/alt naming safety (in case other code imported old class name)
+PaperResolveResult = PaperResolutionResult
+
+
+_RE_FLOAT = re.compile(r"([-+]?\d+(?:\.\d+)?)")
+
+
+def _now_iso_utc() -> str:
+    return dt.datetime.now(dt.UTC).isoformat()
+
+
 def _parse_iso(ts: str) -> Optional[dt.datetime]:
     if not ts:
         return None
     try:
-        ts = ts.replace("Z", "+00:00")  # tolerate Z suffix
-        parsed = dt.datetime.fromisoformat(ts)
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=dt.UTC)
-        return parsed.astimezone(dt.UTC)
+        s = str(ts).replace("Z", "+00:00")
+        d = dt.datetime.fromisoformat(s)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=dt.UTC)
+        return d.astimezone(dt.UTC)
     except Exception:
         return None
 
 
-def _extract_entry_price_cents_from_reasons(reasons: str) -> Optional[int]:
+def _to_float(v: Any) -> Optional[float]:
+    try:
+        if v is None or isinstance(v, bool):
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+
+def _get_db_path_from_store(store: Any) -> str:
     """
-    Optional parser if 'entry_price_cents:XX' is stored in reasons.
+    Best-effort DB path discovery.
+    Falls back to 'bot_state.db' which matches your Render shell audits.
     """
+    for attr in ("DB_PATH", "db_path", "path", "_db_path"):
+        p = getattr(store, attr, None)
+        if isinstance(p, str) and p.strip():
+            return p.strip()
+    return "bot_state.db"
+
+
+def _parse_number_after(prefix: str, reasons: str) -> Optional[float]:
     if not reasons:
         return None
+    idx = reasons.find(prefix)
+    if idx < 0:
+        return None
+    tail = reasons[idx + len(prefix):]
+    tail = tail.split(";", 1)[0].strip()
+    m = _RE_FLOAT.search(tail)
+    if not m:
+        return None
     try:
-        for part in str(reasons).split(";"):
-            p = part.strip().lower()
-            if p.startswith("entry_price_cents:"):
-                return int(p.split(":", 1)[1].strip())
+        return float(m.group(1))
     except Exception:
         return None
+
+
+def _parse_int_after(prefix: str, reasons: str) -> Optional[int]:
+    v = _parse_number_after(prefix, reasons)
+    if v is None:
+        return None
+    try:
+        return int(round(float(v)))
+    except Exception:
+        return None
+
+
+def _extract_entry_price_cents(reasons: str) -> Optional[int]:
+    # main.py appends entry_price_cents:<int> for entries
+    px = _parse_int_after("entry_price_cents:", reasons or "")
+    if px is None:
+        return None
+    if 1 <= px <= 99:
+        return px
     return None
 
 
-def _estimate_entry_price_from_decision(row: dict) -> Optional[int]:
+def _extract_exit_price_cents(reasons: str) -> Optional[int]:
     """
-    Fallback entry price estimate from conviction / direction when exact entry isn't logged.
-    This is a proxy only. Better: store actual simulated entry price in decision row.
+    Exit rows SHOULD log exit_price_cents, but your current main.py exit path
+    logs entry_price_cents:<exit_px>. We support both.
     """
-    action = str(row.get("action", ""))
-    direction = str(row.get("direction", "SKIP")).upper()
-    if not action.startswith("TRADE_") or direction not in {"YES", "NO"}:
+    px = _parse_int_after("exit_price_cents:", reasons or "")
+    if px is None:
+        px = _parse_int_after("entry_price_cents:", reasons or "")
+    if px is None:
         return None
-
-    conv = float(row.get("final_conviction", 50.0))
-    implied = int(round(max(5, min(95, 50 + (conv - 50) * 0.35))))
-
-    if direction == "YES":
-        return implied
-
-    # For NO buys, convert estimated NO entry into yes-space reference
-    no_price = implied
-    return 100 - no_price
+    if 1 <= px <= 99:
+        return px
+    return None
 
 
-def _paper_pnl_from_mark(
+def _extract_order_count(reasons: str) -> Optional[int]:
+    # main.py appends order_count:<int> on entries
+    c = _parse_int_after("order_count:", reasons or "")
+    if c is None:
+        return None
+    return int(max(0, c))
+
+
+def _extract_exit_count(reasons: str) -> Optional[int]:
+    c = _parse_int_after("exit_count:", reasons or "")
+    if c is None:
+        return None
+    return int(max(0, c))
+
+
+def _compute_realized_pnl_from_prices(
+    *,
+    direction: str,
+    entry_price_cents: int,
+    exit_price_cents: int,
+    count: int,
+) -> float:
+    """
+    Binary contract PnL approximation per contract:
+      PnL = (exit - entry) / 100 for YES exposure
+      For NO exposure, treat NO price directly:
+        - Here we store entry/exit in the same "contract side price space" (YES for YES trades, NO for NO trades)
+        - Our entry/exit prices extracted are side prices (YES px if TRADE_YES / NO px if TRADE_NO)
+      => For both: pnl = (exit - entry) * count / 100
+    """
+    d = str(direction or "").upper()
+    entry_px = int(max(1, min(99, entry_price_cents)))
+    exit_px = int(max(1, min(99, exit_price_cents)))
+    c = int(max(0, count))
+    if c <= 0:
+        return 0.0
+
+    # Same formula works if entry/exit are in same side's price space
+    pnl = (float(exit_px) - float(entry_px)) * float(c) / 100.0
+    return float(round(pnl, 4))
+
+
+def _compute_mark_to_market_pnl(
     *,
     direction: str,
     stake_dollars: float,
@@ -72,64 +163,33 @@ def _paper_pnl_from_mark(
     mark_yes_price_cents: int,
 ) -> float:
     """
-    Approximate paper PnL using yes-price mark-to-market.
-    Ignores fees/slippage/partial fills (MVP approximation).
+    Mark-to-market PnL approximation from YES-price space.
+    Uses stake sizing approximation similar to your earlier resolver.
     """
-    direction = direction.upper()
-    entry_yes = max(1, min(99, int(entry_yes_price_cents)))
-    mark_yes = max(1, min(99, int(mark_yes_price_cents)))
-    stake = max(0.0, float(stake_dollars))
+    d = str(direction or "").upper()
+    stake = float(max(0.0, stake_dollars))
+
+    entry_yes = int(max(1, min(99, entry_yes_price_cents)))
+    mark_yes = int(max(1, min(99, mark_yes_price_cents)))
 
     if stake <= 0:
         return 0.0
 
-    if direction == "YES":
+    if d == "YES":
         entry_cost = entry_yes / 100.0
         contracts = stake / entry_cost if entry_cost > 0 else 0.0
         pnl = contracts * ((mark_yes - entry_yes) / 100.0)
-        return round(pnl, 4)
+        return float(round(pnl, 4))
 
-    if direction == "NO":
+    if d == "NO":
+        # For NO, treat as holding NO side; convert from YES-space to NO-space
         entry_no = (100 - entry_yes) / 100.0
         mark_no = (100 - mark_yes) / 100.0
         contracts = stake / entry_no if entry_no > 0 else 0.0
         pnl = contracts * (mark_no - entry_no)
-        return round(pnl, 4)
+        return float(round(pnl, 4))
 
     return 0.0
-
-
-def _extract_minimal_market_quality(summary: dict) -> dict:
-    """
-    Pull a few quality indicators from summarize_market with safe defaults.
-    This avoids relying too heavily on exact schema shape.
-    """
-    spread = summary.get("spread_cents", None)
-    volume = summary.get("volume", None)
-    mid_yes = summary.get("mid_yes_cents", None)
-    status = str(summary.get("status", "unknown")).lower()
-
-    try:
-        spread = None if spread is None else int(round(float(spread)))
-    except Exception:
-        spread = None
-
-    try:
-        volume = None if volume is None else float(volume)
-    except Exception:
-        volume = None
-
-    try:
-        mid_yes = None if mid_yes is None else int(round(float(mid_yes)))
-    except Exception:
-        mid_yes = None
-
-    return {
-        "spread_cents": spread,
-        "volume": volume,
-        "mid_yes_cents": mid_yes,
-        "status": status,
-    }
 
 
 def resolve_paper_trades(
@@ -141,53 +201,226 @@ def resolve_paper_trades(
     min_age_minutes: int = 15,
 ) -> PaperResolutionResult:
     """
-    Mark unresolved DRY_RUN trades as 'resolved' after they are old enough, using current market mark.
-    This enables simulated W/L and PnL stats for learning + Discord summaries.
+    DRY_RUN trade lifecycle resolver.
 
-    Requirements:
-    - store.unresolved_trade_decisions(...)
-    - store.update_decision_outcome(...)
-    - client.get_market(ticker)
-    - market_data.summarize_market(...)
+    What it does (in order):
+    1) Pair EXIT rows to latest unmatched ENTRY row for same ticker + side (YES/NO) and compute realized PnL.
+       - Updates ENTRY row: realized_pnl, won, resolved_ts
+       - Marks EXIT row resolved_ts (so it can't be reused)
+    2) Optional fallback: if there are old ENTRY trades with no exit, mark-to-market resolve using current mid.
+       - Updates ENTRY row similarly
+
+    This is what makes your Discord scorecard stats "real" in DRY_RUN.
     """
-    rows = store.unresolved_trade_decisions(limit=max_to_check, dry_run=True)
+    db_path = _get_db_path_from_store(store)
     now = dt.datetime.now(dt.UTC)
+    now_iso = now.isoformat()
 
     updated = 0
     checked = 0
     skipped = 0
 
-    # Guardrails so learning isn't trained on garbage marks.
-    # These are intentionally permissive (not too conservative).
-    max_resolve_spread_cents = 12
-    min_resolve_volume = 1.0
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    cur = con.cursor()
 
-    # If pnl is near-zero, don't force a win/loss label.
-    flat_pnl_epsilon = 0.10  # $0.10
+    # Ensure table exists
+    try:
+        cur.execute("SELECT 1 FROM decisions LIMIT 1;").fetchone()
+    except Exception as e:
+        con.close()
+        raise RuntimeError(f"decisions table not found or unreadable in {db_path}: {e}")
 
-    for row in rows:
+    # -----------------------------
+    # PASS 1: Resolve explicit exits
+    # -----------------------------
+    exit_rows = cur.execute(
+        """
+        SELECT id, ts, ticker, action, dry_run, reasons, resolved_ts
+        FROM decisions
+        WHERE dry_run = 1
+          AND action IN ('TRADE_EXIT_YES', 'TRADE_EXIT_NO')
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (int(max_to_check),),
+    ).fetchall()
+
+    for ex in exit_rows:
         checked += 1
 
-        ts = _parse_iso(str(row.get("ts", "")))
-        if ts is None:
+        # Already used/processed exit
+        if ex["resolved_ts"] is not None:
             skipped += 1
-            if logger:
-                logger.debug(f"Paper resolver skip id={row.get('id')} reason=bad_ts")
             continue
 
-        age_min = (now - ts).total_seconds() / 60.0
+        ex_ts = _parse_iso(str(ex["ts"] or ""))
+        if ex_ts is None:
+            skipped += 1
+            continue
+
+        age_min = (now - ex_ts).total_seconds() / 60.0
         if age_min < float(min_age_minutes):
             skipped += 1
             continue
 
-        ticker = row.get("ticker")
+        ticker = str(ex["ticker"] or "").strip()
         if not ticker:
             skipped += 1
-            if logger:
-                logger.debug(f"Paper resolver skip id={row.get('id')} reason=no_ticker")
             continue
 
-        # Pull current mark
+        exit_action = str(ex["action"] or "")
+        held_side = "YES" if exit_action.endswith("_YES") else "NO"
+        entry_action = "TRADE_YES" if held_side == "YES" else "TRADE_NO"
+
+        exit_reasons = str(ex["reasons"] or "")
+        exit_px = _extract_exit_price_cents(exit_reasons)
+        exit_cnt = _extract_exit_count(exit_reasons)
+
+        if exit_px is None:
+            skipped += 1
+            continue
+
+        # Find latest unmatched entry for this ticker + side (unresolved)
+        ent = cur.execute(
+            """
+            SELECT id, ts, ticker, action, dry_run, stake_dollars, reasons, resolved_ts
+            FROM decisions
+            WHERE dry_run = 1
+              AND ticker = ?
+              AND action = ?
+              AND resolved_ts IS NULL
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (ticker, entry_action),
+        ).fetchone()
+
+        if not ent:
+            skipped += 1
+            continue
+
+        entry_id = int(ent["id"])
+        entry_reasons = str(ent["reasons"] or "")
+
+        entry_px = _extract_entry_price_cents(entry_reasons)
+        entry_cnt = _extract_order_count(entry_reasons)
+
+        if entry_px is None or entry_cnt is None or entry_cnt <= 0:
+            skipped += 1
+            continue
+
+        count_used = int(entry_cnt)
+        if exit_cnt is not None and exit_cnt > 0:
+            count_used = int(min(count_used, exit_cnt))
+        if count_used <= 0:
+            skipped += 1
+            continue
+
+        pnl = _compute_realized_pnl_from_prices(
+            direction=held_side,
+            entry_price_cents=int(entry_px),
+            exit_price_cents=int(exit_px),
+            count=int(count_used),
+        )
+
+        if pnl > 0:
+            won_val: Optional[int] = 1
+        elif pnl < 0:
+            won_val = 0
+        else:
+            won_val = 0
+
+        # Update entry as resolved
+        cur.execute(
+            """
+            UPDATE decisions
+            SET realized_pnl = ?,
+                won = ?,
+                resolved_ts = ?
+            WHERE id = ?
+            """,
+            (float(pnl), int(won_val), now_iso, entry_id),
+        )
+
+        # Mark exit as consumed so it can't resolve multiple entries
+        cur.execute(
+            """
+            UPDATE decisions
+            SET resolved_ts = ?
+            WHERE id = ?
+            """,
+            (now_iso, int(ex["id"])),
+        )
+
+        con.commit()
+        updated += 1
+
+        if logger:
+            logger.info(
+                f"PaperResolver (EXIT) resolved ticker={ticker} side={held_side} "
+                f"entry_id={entry_id} exit_id={int(ex['id'])} entry_px={entry_px} exit_px={exit_px} "
+                f"count={count_used} pnl={pnl:.4f} won={won_val}"
+            )
+
+    # -----------------------------
+    # PASS 2: Mark-to-market resolve old entries (no exit found)
+    # -----------------------------
+    # This prevents scorecards from staying at resolved=0 when exits are rare.
+    entry_rows = cur.execute(
+        """
+        SELECT id, ts, ticker, action, dry_run, stake_dollars, direction, reasons, resolved_ts
+        FROM decisions
+        WHERE dry_run = 1
+          AND action IN ('TRADE_YES','TRADE_NO')
+          AND resolved_ts IS NULL
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (int(max_to_check),),
+    ).fetchall()
+
+    # Guardrails (permissive but avoids garbage marks)
+    max_spread_cents = 12
+    min_volume = 1.0
+    flat_pnl_epsilon = 0.10  # do not label micro noise as win/loss
+
+    for r in entry_rows:
+        checked += 1
+
+        r_ts = _parse_iso(str(r["ts"] or ""))
+        if r_ts is None:
+            skipped += 1
+            continue
+
+        age_min = (now - r_ts).total_seconds() / 60.0
+        if age_min < float(min_age_minutes):
+            skipped += 1
+            continue
+
+        ticker = str(r["ticker"] or "").strip()
+        if not ticker:
+            skipped += 1
+            continue
+
+        stake = _to_float(r["stake_dollars"]) or 0.0
+        if stake <= 0:
+            skipped += 1
+            continue
+
+        reasons = str(r["reasons"] or "")
+        entry_px = _extract_entry_price_cents(reasons)
+        if entry_px is None:
+            # We do NOT estimate here; if your bot doesn't log entry_price_cents, fix logging instead.
+            skipped += 1
+            continue
+
+        direction = str(r["direction"] or "").upper()
+        if direction not in {"YES", "NO"}:
+            skipped += 1
+            continue
+
+        # Pull current mark for mid_yes
         try:
             raw_market = client.get_market(str(ticker))
             market_obj = raw_market
@@ -195,100 +428,85 @@ def resolve_paper_trades(
                 market_obj = raw_market["market"]
 
             s = summarize_market(market_obj)
-            quality = _extract_minimal_market_quality(s)
 
-            mark_yes = quality["mid_yes_cents"]
-            market_category = str(s.get("category", "")) if s.get("category") is not None else None
+            # minimal quality checks
+            spread = s.get("spread_cents", None)
+            vol = s.get("volume", None)
+            mid_yes = s.get("mid_yes_cents", None)
 
-            if mark_yes is None:
+            spread_i = None
+            try:
+                spread_i = None if spread is None else int(round(float(spread)))
+            except Exception:
+                spread_i = None
+
+            vol_f = None
+            try:
+                vol_f = None if vol is None else float(vol)
+            except Exception:
+                vol_f = None
+
+            mid_i = None
+            try:
+                mid_i = None if mid_yes is None else int(round(float(mid_yes)))
+            except Exception:
+                mid_i = None
+
+            if mid_i is None or not (1 <= mid_i <= 99):
                 skipped += 1
-                if logger:
-                    logger.debug(f"Paper resolver skip {ticker} reason=no_mark")
                 continue
 
-            # Avoid resolving on trash marks (wide or dead markets)
-            spread = quality["spread_cents"]
-            volume = quality["volume"]
-            status = quality["status"]
-
-            if spread is not None and spread > max_resolve_spread_cents:
+            if spread_i is not None and spread_i > int(max_spread_cents):
                 skipped += 1
-                if logger:
-                    logger.debug(
-                        f"Paper resolver skip {ticker} reason=wide_spread spread={spread}>{max_resolve_spread_cents}"
-                    )
                 continue
 
-            if volume is not None and volume < min_resolve_volume:
+            if vol_f is not None and vol_f < float(min_volume):
                 skipped += 1
-                if logger:
-                    logger.debug(
-                        f"Paper resolver skip {ticker} reason=low_volume volume={volume}<{min_resolve_volume}"
-                    )
                 continue
-
-            # If clearly closed/resolved, that's fine; if still trading, also fine (mark-to-market model).
-            # We intentionally do NOT require final market resolution here.
-            _ = status
 
         except Exception as e:
             if logger:
-                logger.warning(f"Paper resolver market fetch failed for {ticker}: {e}")
+                logger.warning(f"PaperResolver (MTM) market fetch failed for {ticker}: {e}")
             skipped += 1
             continue
 
-        direction = str(row.get("direction", "SKIP")).upper()
-        stake_dollars = float(row.get("stake_dollars", 0.0))
-
-        # Try exact simulated entry price first; fallback to estimate.
-        reasons = str(row.get("reasons", ""))
-        entry_yes = _extract_entry_price_cents_from_reasons(reasons)
-        entry_source = "logged"
-        if entry_yes is None:
-            entry_yes = _estimate_entry_price_from_decision(row)
-            entry_source = "estimated"
-
-        if entry_yes is None or direction not in {"YES", "NO"} or stake_dollars <= 0:
-            skipped += 1
-            if logger:
-                logger.debug(
-                    f"Paper resolver skip id={row.get('id')} reason=bad_trade_fields "
-                    f"dir={direction} stake={stake_dollars} entry_yes={entry_yes}"
-                )
-            continue
-
-        pnl = _paper_pnl_from_mark(
+        pnl = _compute_mark_to_market_pnl(
             direction=direction,
-            stake_dollars=stake_dollars,
-            entry_yes_price_cents=entry_yes,
-            mark_yes_price_cents=mark_yes,
+            stake_dollars=float(stake),
+            entry_yes_price_cents=int(entry_px),
+            mark_yes_price_cents=int(mid_i),
         )
 
-        # Don't overfit tiny noise moves into wins/losses
-        if abs(pnl) < flat_pnl_epsilon:
-            won_value = None
+        # Win/loss labeling: don't label tiny noise
+        if abs(pnl) < float(flat_pnl_epsilon):
+            won_val = None
         else:
-            won_value = bool(pnl > 0)
+            won_val = bool(pnl > 0)
 
-        try:
-            store.update_decision_outcome(
-                decision_id=int(row["id"]),
-                realized_pnl=float(pnl),
-                won=won_value,
-                resolved_ts=now.isoformat(),
-                market_category=market_category,
+        cur.execute(
+            """
+            UPDATE decisions
+            SET realized_pnl = ?,
+                won = ?,
+                resolved_ts = ?
+            WHERE id = ?
+            """,
+            (
+                float(pnl),
+                None if won_val is None else (1 if won_val else 0),
+                now_iso,
+                int(r["id"]),
+            ),
+        )
+
+        con.commit()
+        updated += 1
+
+        if logger:
+            logger.info(
+                f"PaperResolver (MTM) resolved id={int(r['id'])} ticker={ticker} dir={direction} "
+                f"entry_yes_px={entry_px} mark_yes_px={mid_i} stake={stake:.2f} pnl={pnl:.4f} won={won_val}"
             )
-            updated += 1
 
-            if logger:
-                logger.info(
-                    f"Paper resolved id={row['id']} {ticker} dir={direction} "
-                    f"entry_yes={entry_yes}({entry_source}) mark_yes={mark_yes} "
-                    f"stake={stake_dollars:.2f} pnl={pnl:.4f} won={won_value}"
-                )
-        except Exception as e:
-            if logger:
-                logger.warning(f"Paper resolver update failed for decision id={row.get('id')}: {e}")
-            skipped += 1
-
+    con.close()
     return PaperResolutionResult(updated=updated, checked=checked, skipped=skipped)

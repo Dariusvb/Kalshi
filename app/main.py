@@ -1629,6 +1629,20 @@ class BotApp:
             reasons.append(f"risk_gate_wr_n:{winrate_sample}")
 
         # -----------------------------
+        # Guard: Prevent hammering the same ticker
+        # -----------------------------
+        force_guard_skip = False
+        if getattr(sig, "direction", "SKIP") != "SKIP":
+            if self._find_open_position_for_ticker(str(chosen["ticker"])):
+                self.logger.info(f"Guard: Open position already exists for {chosen['ticker']}. Forcing SKIP.")
+                force_guard_skip = True
+                reasons.append("guard:already_have_open_position")
+                try:
+                    sig.direction = "SKIP"
+                except AttributeError:
+                    pass
+
+        # -----------------------------
         # DRY_RUN-only pipeline test entry (bounded, safe)
         # Does not alter live behavior or strategy logic.
         # -----------------------------
@@ -1649,7 +1663,7 @@ class BotApp:
         except Exception as e:
             self.logger.warning(f"Pipeline test entry check failed (continuing normal logic): {e}")
 
-        should_enter_normal = (sig.direction != "SKIP" and risk.allowed)
+        should_enter_normal = (sig.direction != "SKIP" and not force_guard_skip and risk.allowed)
         should_enter_test = bool(forced_pipeline_test and pipeline_test_order is not None)
 
         if should_enter_normal or should_enter_test:

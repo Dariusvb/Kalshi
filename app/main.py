@@ -1667,6 +1667,7 @@ class BotApp:
         should_enter_test = bool(forced_pipeline_test and pipeline_test_order is not None)
 
         if should_enter_normal or should_enter_test:
+            # --- Build the order first ---
             if should_enter_test:
                 order = pipeline_test_order
                 used_direction = "YES"
@@ -1677,9 +1678,38 @@ class BotApp:
                 used_direction = str(sig.direction)
                 used_stake_dollars = float(risk.stake_dollars)
 
+            # --- HARD log required fields (no silent pass) ---
+            order_price_cents: Optional[int] = None
+            order_count: Optional[int] = None
+
             try:
-                reasons.append(f"entry_price_cents:{int(order['price_cents'])}")
-                reasons.append(f"order_count:{int(order['count'])}")
+                order_price_cents = int(order.get("price_cents"))  # type: ignore[arg-type]
+            except Exception:
+                order_price_cents = None
+
+            try:
+                order_count = int(order.get("count"))  # type: ignore[arg-type]
+            except Exception:
+                order_count = None
+
+            if order_price_cents is not None:
+                # normalize to sane Kalshi cents range
+                order_price_cents = int(max(1, min(99, order_price_cents)))
+                reasons.append(f"entry_price_cents:{order_price_cents}")
+            else:
+                # if this happens, something is broken upstream; record it explicitly
+                reasons.append("entry_price_cents:missing")
+
+            if order_count is not None:
+                order_count = int(max(0, order_count))
+                reasons.append(f"order_count:{order_count}")
+            else:
+                reasons.append("order_count:missing")
+
+            # Optional: also log yes/no + side for debugging and resolver pairing
+            try:
+                reasons.append(f"order_side:{str(order.get('side'))}")
+                reasons.append(f"order_yes_no:{str(order.get('yes_no'))}")
             except Exception:
                 pass
 
@@ -1712,6 +1742,15 @@ class BotApp:
                     f"| dry_run={self.settings.DRY_RUN}"
                     f"{' | pipeline_test=1' if should_enter_test else ''}"
                 )
+
+            except KalshiAPIError as e:
+                action = "ERROR"
+                self.logger.exception(f"Order error: {e}")
+                self.notifier.send(f"⚠️ Kalshi order error: {e}")
+        else:
+            self.logger.info(
+                f"SKIP {chosen['ticker']} | dir={sig.direction} | conv={final_conviction:.1f} | risk={risk.reason}"
+            )
 
             except KalshiAPIError as e:
                 action = "ERROR"

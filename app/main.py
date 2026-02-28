@@ -1693,11 +1693,9 @@ class BotApp:
                 order_count = None
 
             if order_price_cents is not None:
-                # normalize to sane Kalshi cents range
                 order_price_cents = int(max(1, min(99, order_price_cents)))
                 reasons.append(f"entry_price_cents:{order_price_cents}")
             else:
-                # if this happens, something is broken upstream; record it explicitly
                 reasons.append("entry_price_cents:missing")
 
             if order_count is not None:
@@ -1747,15 +1745,7 @@ class BotApp:
                 action = "ERROR"
                 self.logger.exception(f"Order error: {e}")
                 self.notifier.send(f"⚠️ Kalshi order error: {e}")
-        else:
-            self.logger.info(
-                f"SKIP {chosen['ticker']} | dir={sig.direction} | conv={final_conviction:.1f} | risk={risk.reason}"
-            )
 
-            except KalshiAPIError as e:
-                action = "ERROR"
-                self.logger.exception(f"Order error: {e}")
-                self.notifier.send(f"⚠️ Kalshi order error: {e}")
         else:
             self.logger.info(
                 f"SKIP {chosen['ticker']} | dir={sig.direction} | conv={final_conviction:.1f} | risk={risk.reason}"

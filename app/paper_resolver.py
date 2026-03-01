@@ -501,10 +501,12 @@ def resolve_paper_trades(
 
             s = summarize_market(market_obj)
             status_s = str(s.get("status", "") or "")
+
             try:
                 spread_i = None if s.get("spread_cents") is None else int(round(float(s.get("spread_cents"))))
             except Exception:
                 spread_i = None
+
             try:
                 vol_f = None if s.get("volume") is None else float(s.get("volume"))
             except Exception:
@@ -520,8 +522,8 @@ def resolve_paper_trades(
             mark_src = "fallback_zero"
             mark_yes_i = None
 
+        # Compute MTM pnl (always end up with a float, never tuple/None)
         if mark_yes_i is None:
-            # Resolve with pnl=0
             pnl = 0.0
         else:
             pnl = _compute_mtm_pnl_from_mark(
@@ -530,6 +532,14 @@ def resolve_paper_trades(
                 mark_yes_cents=int(mark_yes_i),
                 count=int(count),
             )
+
+        # ✅ Bulletproof: prevent tuple/None/NaN from crashing resolver
+        if isinstance(pnl, tuple):
+            pnl = pnl[0] if pnl else 0.0
+        try:
+            pnl = float(pnl)
+        except Exception:
+            pnl = 0.0
 
         # Determine won flag
         if abs(pnl) < float(flat_pnl_epsilon):
@@ -560,14 +570,15 @@ def resolve_paper_trades(
 
         # ✅ Upgraded MTM log line (one-liner, packed + debuggable)
         if logger:
-            mark_no = (100 - mark_yes_i) if isinstance(mark_yes_i, int) else None
+            mark_no = int(max(1, min(99, 100 - int(mark_yes_i)))) if isinstance(mark_yes_i, int) else None
+            side = "YES" if action == "TRADE_YES" else ("NO" if action == "TRADE_NO" else "?")
             logger.info(
                 "PaperResolver (MTM) resolved "
-                f"id={int(r['id'])} age_min={age_min:.1f} ticker={ticker} action={action} "
-                f"entry_px_side={entry_px} count={count} "
+                f"id={int(r['id'])} age_min={age_min:.1f} ticker={ticker} side={side} action={action} "
+                f"entry_px_side={int(entry_px)} count={int(count)} "
                 f"mark_yes={mark_yes_i} mark_no={mark_no} mark_src={mark_src} "
                 f"status={status_s} spread={spread_i} vol={vol_f} "
-                f"pnl={pnl:.4f} won={won_val_log} mtm_reason={mtm_reason}"
+                f"pnl={float(pnl):.4f} won={won_val_log} mtm_reason={mtm_reason}"
             )
 
     try:

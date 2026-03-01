@@ -137,6 +137,20 @@ def _extract_exit_count(reasons: str) -> Optional[int]:
     return int(max(0, c))
 
 
+def _extract_exit_entry_id(reasons: str) -> Optional[int]:
+    """
+    Optional linkage if trader logs entry_id:<id> on TRADE_EXIT_* rows.
+    """
+    v = _parse_int_after("entry_id:", reasons or "")
+    if v is None:
+        return None
+    try:
+        v = int(v)
+        return v if v > 0 else None
+    except Exception:
+        return None
+
+
 def _compute_realized_pnl_from_prices(*, entry_px: int, exit_px: int, count: int) -> float:
     """
     PnL in *side price space* (YES prices for YES trades, NO prices for NO trades):
@@ -195,15 +209,17 @@ def resolve_paper_trades(
     """
     DRY_RUN trade lifecycle resolver.
 
-    Pass 1) Resolve explicit exits:
-      - Pair TRADE_EXIT_YES/NO to latest unresolved TRADE_YES/NO for same ticker
+    Pass 1) Resolve explicit exits (PRIMARY):
+      - Prefer linking via entry_id if present on exit reasons
+      - Else fall back to (ticker + side) pairing to the latest unresolved entry
       - Compute realized PnL using entry/exit prices in side-space and count
       - Tags both entry + exit reasons for auditability:
           entry: exit_resolved:1;exit_id:<id>;exit_px_cents:<px>;exit_cnt:<cnt>;exit_side:<YES|NO>
           exit:  exit_consumed:1;entry_id:<id>;exit_resolve_reason:explicit
 
-    Pass 2) MTM resolve old entries with no exits:
-      - Uses current mark from market (prefers mid_yes; else avg(bid,ask); else bid; else ask)
+    Pass 2) MTM resolve old entries with no exits (FALLBACK ONLY):
+      - MTM fallback delay: mtm_fallback_minutes = 60 (or >= min_age_minutes)
+      - Uses current mark from market (prefers mid_yes; else avg(bid,ask); then bid; then ask)
       - Uses entry_price_cents + order_count from reasons
       - NO trades use mark_no = 100 - mark_yes
       - If market fetch fails -> resolves with pnl=0 + mtm_label:market_fetch_failed
@@ -280,6 +296,9 @@ def resolve_paper_trades(
     # Learning hygiene: don't label pennies as win/loss
     flat_pnl_epsilon = 0.01
 
+    # MTM fallback delay (requested)
+    mtm_fallback_minutes = max(float(min_age_minutes), 60.0)
+
     # Unusable-quote delay policy knobs
     unusable_defer_minutes = 60               # don't label unusable quotes for at least 60 minutes
     unusable_force_resolve_minutes = 12 * 60  # after 12 hours, force resolve to 0.0 (so it can't stall forever)
@@ -336,25 +355,49 @@ def resolve_paper_trades(
             exit_reasons = str(ex["reasons"] or "")
             exit_px = _extract_exit_price_cents(exit_reasons)
             exit_cnt = _extract_exit_count(exit_reasons)
+            prefer_entry_id = _extract_exit_entry_id(exit_reasons)
 
             if exit_px is None:
                 skipped += 1
                 continue
 
-            # Find latest unresolved matching entry
-            ent = cur.execute(
-                """
-                SELECT id, ts, ticker, action, dry_run, reasons, resolved_ts
-                FROM decisions
-                WHERE dry_run = 1
-                  AND ticker = ?
-                  AND action = ?
-                  AND resolved_ts IS NULL
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (ticker, entry_action),
-            ).fetchone()
+            # Prefer explicit linkage if exit has entry_id:<id>
+            ent = None
+            if prefer_entry_id is not None:
+                ent = cur.execute(
+                    """
+                    SELECT id, ts, ticker, action, dry_run, reasons, resolved_ts
+                    FROM decisions
+                    WHERE dry_run = 1
+                      AND id = ?
+                      AND action IN ('TRADE_YES','TRADE_NO')
+                      AND resolved_ts IS NULL
+                    """,
+                    (int(prefer_entry_id),),
+                ).fetchone()
+
+                # If the pointed entry doesn't match ticker/side, don't force it
+                if ent:
+                    ent_tkr = str(ent["ticker"] or "").strip()
+                    ent_action = str(ent["action"] or "")
+                    if ent_tkr != ticker or ent_action != entry_action:
+                        ent = None
+
+            # Fallback: latest unresolved matching entry by (ticker, side)
+            if not ent:
+                ent = cur.execute(
+                    """
+                    SELECT id, ts, ticker, action, dry_run, reasons, resolved_ts
+                    FROM decisions
+                    WHERE dry_run = 1
+                      AND ticker = ?
+                      AND action = ?
+                      AND resolved_ts IS NULL
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (ticker, entry_action),
+                ).fetchone()
 
             if not ent:
                 skipped += 1
@@ -369,6 +412,7 @@ def resolve_paper_trades(
                 skipped += 1
                 continue
 
+            # Use min(entry_cnt, exit_cnt) if exit_count provided
             count_used = int(entry_cnt)
             if exit_cnt is not None and int(exit_cnt) > 0:
                 count_used = int(min(count_used, int(exit_cnt)))
@@ -382,6 +426,7 @@ def resolve_paper_trades(
                 count=int(count_used),
             )
 
+            # Sanity: max absolute pnl in dollars is count * $0.99
             max_abs = float(count_used) * 0.99
             if abs(float(pnl)) > (max_abs + 1e-6):
                 skipped += 1
@@ -394,6 +439,7 @@ def resolve_paper_trades(
                     )
                 continue
 
+            # Won/lost: for explicit exits we always classify (0 pnl => loss)
             won_val: int = 1 if float(pnl) > 0 else 0
 
             # Tag entry + exit
@@ -444,7 +490,7 @@ def resolve_paper_trades(
                 )
 
         # -----------------------------
-        # PASS 2: MTM resolve old entries (no exit found)
+        # PASS 2: MTM resolve old entries (no exit found) - FALLBACK ONLY
         # -----------------------------
         entry_rows = cur.execute(
             """
@@ -468,7 +514,9 @@ def resolve_paper_trades(
                 continue
 
             age_min = (now - r_ts).total_seconds() / 60.0
-            if age_min < float(min_age_minutes):
+
+            # MTM fallback delay (requested): give explicit exits time to show up
+            if age_min < float(mtm_fallback_minutes):
                 skipped += 1
                 continue
 
@@ -542,12 +590,11 @@ def resolve_paper_trades(
                 if yes_bid_i == 0 and yes_ask_i == 100:
                     unusable = True
 
-                # If your summarize_market mid is 50 while spread is 100, it's degenerate
+                # If summarize_market mid is 50 while spread is 100, it's degenerate
                 if mark_yes_i == 50 and spread_i == 100:
                     unusable = True
 
                 # Status gate: only reject if we are sure it's not tradable
-                # (keep this permissive to avoid false unusable)
                 if status_s and status_s.strip():
                     st = status_s.strip().lower()
                     if st in ("closed", "settled", "finalized", "resolved", "cancelled", "canceled"):

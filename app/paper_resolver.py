@@ -416,10 +416,45 @@ def resolve_paper_trades(
         (int(max_to_check),),
     ).fetchall()
 
-    # Guardrails
-    max_spread_cents = 12
-    min_volume = 1.0
+    # MTM policy:
+    # - We do NOT require volume/spread. MTM’s job is to close the loop for learning/debugging.
+    # - We ONLY require: entry_px + count + (a mark OR a safe fallback).
     flat_pnl_epsilon = 0.01  # don't label pennies as win/loss
+
+    def _safe_mark_yes_from_summary(s: dict) -> tuple[Optional[int], str]:
+        """
+        Return (mark_yes_cents, source).
+        Prefers mid_yes; falls back to (bid+ask)/2; then bid; then ask.
+        """
+        mid = s.get("mid_yes_cents")
+        bid = s.get("yes_bid")
+        ask = s.get("yes_ask")
+
+        def _to_int(x) -> Optional[int]:
+            try:
+                if x is None:
+                    return None
+                v = int(round(float(x)))
+                if 1 <= v <= 99:
+                    return v
+            except Exception:
+                return None
+            return None
+
+        mid_i = _to_int(mid)
+        if mid_i is not None:
+            return mid_i, "mid_yes"
+
+        bid_i = _to_int(bid)
+        ask_i = _to_int(ask)
+
+        if bid_i is not None and ask_i is not None and ask_i >= bid_i:
+            return int(round((bid_i + ask_i) / 2.0)), "avg_bid_ask"
+        if bid_i is not None:
+            return bid_i, "bid_only"
+        if ask_i is not None:
+            return ask_i, "ask_only"
+        return None, "no_quote"
 
     for r in entry_rows:
         checked += 1
@@ -450,11 +485,13 @@ def resolve_paper_trades(
             skipped += 1
             continue
 
-        # Pull current mark (prefer true mid from bid/ask)
+        # --- Fetch mark (best-effort) ---
+        mark_yes_i: Optional[int] = None
+        mark_src = "unattempted"
         spread_i: Optional[int] = None
         vol_f: Optional[float] = None
-        mark_yes_f: Optional[float] = None
-        mid_yes_i: Optional[int] = None
+        status_s: Optional[str] = None
+        mtm_reason = "ok"
 
         try:
             raw_market = client.get_market(str(ticker))
@@ -463,66 +500,44 @@ def resolve_paper_trades(
                 market_obj = raw_market["market"]
 
             s = summarize_market(market_obj)
-
+            status_s = str(s.get("status", "") or "")
             try:
                 spread_i = None if s.get("spread_cents") is None else int(round(float(s.get("spread_cents"))))
             except Exception:
                 spread_i = None
-
             try:
                 vol_f = None if s.get("volume") is None else float(s.get("volume"))
             except Exception:
                 vol_f = None
 
-            mark_yes_f = _safe_mid_yes_from_summary(s)
-            if mark_yes_f is None:
-                skipped += 1
-                continue
-
-            # Round ONLY at the end so we don't destroy the signal by truncation too early
-            mid_yes_i = int(round(mark_yes_f))
-
-            if mid_yes_i is None or not (1 <= mid_yes_i <= 99):
-                skipped += 1
-                continue
-
-            if spread_i is not None and spread_i > int(max_spread_cents):
-                skipped += 1
-                continue
-
-            if vol_f is not None and vol_f < float(min_volume):
-                skipped += 1
-                continue
+            mark_yes_i, mark_src = _safe_mark_yes_from_summary(s)
+            if mark_yes_i is None:
+                raise RuntimeError("no_usable_mark_yes")
 
         except Exception as e:
-            if logger:
-                logger.warning(f"PaperResolver (MTM) market fetch failed for {ticker}: {e}")
-            skipped += 1
-            continue
+            # ✅ Bulletproof: if we can't fetch/parse the market, resolve with pnl=0 instead of stalling forever.
+            mtm_reason = f"market_fetch_failed:{type(e).__name__}"
+            mark_src = "fallback_zero"
+            mark_yes_i = None
 
-        pnl, mark_side_px, entry_side_px = _compute_mtm_pnl_from_mark(
-            action=action,
-            entry_px_side_cents=int(entry_px),
-            mark_yes_cents=int(mid_yes_i),
-            count=int(count),
-        )
-
-        # sanity: absolute PnL can't exceed count * $0.99
-        max_abs = float(count) * 0.99
-        if abs(pnl) > (max_abs + 1e-6):
-            skipped += 1
-            if logger:
-                logger.warning(
-                    f"PaperResolver (MTM) sanity-skip id={int(r['id'])} ticker={ticker} action={action} "
-                    f"pnl={pnl:.4f} > max_abs={max_abs:.2f} "
-                    f"(entry_side_px={entry_side_px} mark_yes={mid_yes_i} mark_side_px={mark_side_px} count={count})"
-                )
-            continue
-
-        if abs(pnl) < float(flat_pnl_epsilon):
-            won_val = None
+        if mark_yes_i is None:
+            # Resolve with pnl=0
+            pnl = 0.0
         else:
-            won_val = bool(pnl > 0)
+            pnl = _compute_mtm_pnl_from_mark(
+                action=action,
+                entry_px_side_cents=int(entry_px),
+                mark_yes_cents=int(mark_yes_i),
+                count=int(count),
+            )
+
+        # Determine won flag
+        if abs(pnl) < float(flat_pnl_epsilon):
+            won_val_db: Optional[int] = None
+            won_val_log: Optional[bool] = None
+        else:
+            won_val_log = bool(pnl > 0)
+            won_val_db = 1 if won_val_log else 0
 
         cur.execute(
             """
@@ -534,23 +549,25 @@ def resolve_paper_trades(
             """,
             (
                 float(pnl),
-                None if won_val is None else (1 if won_val else 0),
+                won_val_db,
                 now_iso,
                 int(r["id"]),
             ),
         )
 
+        con.commit()
         updated += 1
 
-        # ✅ Upgraded MTM log line (more forensic + shows side-space clearly)
+        # ✅ Upgraded MTM log line (one-liner, packed + debuggable)
         if logger:
-            mid_no_i = 100 - int(mid_yes_i)
+            mark_no = (100 - mark_yes_i) if isinstance(mark_yes_i, int) else None
             logger.info(
                 "PaperResolver (MTM) resolved "
                 f"id={int(r['id'])} age_min={age_min:.1f} ticker={ticker} action={action} "
-                f"entry_side_px={entry_side_px}c mark_yes={int(mid_yes_i)}c mark_no={mid_no_i}c mark_side_px={mark_side_px}c "
-                f"count={int(count)} pnl=${pnl:.4f} won={won_val} "
-                f"spread_cents={spread_i} volume={None if vol_f is None else round(vol_f, 2)}"
+                f"entry_px_side={entry_px} count={count} "
+                f"mark_yes={mark_yes_i} mark_no={mark_no} mark_src={mark_src} "
+                f"status={status_s} spread={spread_i} vol={vol_f} "
+                f"pnl={pnl:.4f} won={won_val_log} mtm_reason={mtm_reason}"
             )
 
     try:

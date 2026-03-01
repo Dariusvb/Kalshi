@@ -198,13 +198,20 @@ def resolve_paper_trades(
     Pass 1) Resolve explicit exits:
       - Pair TRADE_EXIT_YES/NO to latest unresolved TRADE_YES/NO for same ticker
       - Compute realized PnL using entry/exit prices in side-space and count
+      - Tags both entry + exit reasons for auditability:
+          entry: exit_resolved:1;exit_id:<id>;exit_px_cents:<px>;exit_cnt:<cnt>;exit_side:<YES|NO>
+          exit:  exit_consumed:1;entry_id:<id>;exit_resolve_reason:explicit
 
     Pass 2) MTM resolve old entries with no exits:
-      - Uses current mark from market (prefers mid_yes; else avg(bid,ask); else bid/ask)
+      - Uses current mark from market (prefers mid_yes; else avg(bid,ask); else bid; else ask)
       - Uses entry_price_cents + order_count from reasons
       - NO trades use mark_no = 100 - mark_yes
-      - If market fetch fails OR quote is unusable -> resolves with pnl=0 (does not stall forever)
-      - Adds mtm_label tags to reasons so training can skip unlearnable rows
+      - If market fetch fails -> resolves with pnl=0 + mtm_label:market_fetch_failed
+      - If quote is unusable -> DELAY policy:
+          * if too fresh: defer (leave unresolved)
+          * if mid-age: keep deferring (leave unresolved)
+          * if very old: resolve to pnl=0 + mtm_label:unusable_quote (so it doesn't stall forever)
+      - Adds mtm_label tags so training can skip unlearnable rows
     """
     db_path = _get_db_path_from_store(store)
     now = dt.datetime.now(dt.UTC)
@@ -226,21 +233,64 @@ def resolve_paper_trades(
         raise RuntimeError(f"decisions table not found or unreadable in {db_path}: {e}")
 
     def _append_tag(reasons: str, tag: str) -> str:
-        rs = reasons or ""
+        rs = str(reasons or "")
+        if not tag:
+            return rs
         if tag in rs:
             return rs
-        # Keep it compact; always end with ';' to preserve token parsing conventions
         if rs and not rs.endswith(";"):
             rs += ";"
         return rs + tag + ";"
 
-    # Start a safe transaction
-    try:
-        cur.execute("BEGIN;")
-    except Exception:
-        pass
+    def _safe_mark_yes_from_summary(s: dict) -> tuple[Optional[int], str]:
+        """
+        Return (mark_yes_cents, source).
+        Prefers mid_yes; falls back to avg(bid,ask); then bid; then ask.
+        """
+        mid = s.get("mid_yes_cents")
+        bid = s.get("yes_bid")
+        ask = s.get("yes_ask")
 
+        def _to_int(x) -> Optional[int]:
+            try:
+                if x is None:
+                    return None
+                v = int(round(float(x)))
+                if 1 <= v <= 99:
+                    return v
+            except Exception:
+                return None
+            return None
+
+        mid_i = _to_int(mid)
+        if mid_i is not None:
+            return mid_i, "mid_yes"
+
+        bid_i = _to_int(bid)
+        ask_i = _to_int(ask)
+
+        if bid_i is not None and ask_i is not None and ask_i >= bid_i:
+            return int(round((bid_i + ask_i) / 2.0)), "avg_bid_ask"
+        if bid_i is not None:
+            return bid_i, "bid_only"
+        if ask_i is not None:
+            return ask_i, "ask_only"
+        return None, "no_quote"
+
+    # Learning hygiene: don't label pennies as win/loss
+    flat_pnl_epsilon = 0.01
+
+    # Unusable-quote delay policy knobs
+    unusable_defer_minutes = 60               # don't label unusable quotes for at least 60 minutes
+    unusable_force_resolve_minutes = 12 * 60  # after 12 hours, force resolve to 0.0 (so it can't stall forever)
+
+    # Single safe transaction for both passes
     try:
+        try:
+            cur.execute("BEGIN;")
+        except Exception:
+            pass
+
         # -----------------------------
         # PASS 1: Resolve explicit exits
         # -----------------------------
@@ -319,7 +369,6 @@ def resolve_paper_trades(
                 skipped += 1
                 continue
 
-            # Use min(entry_cnt, exit_cnt) if exit_count provided
             count_used = int(entry_cnt)
             if exit_cnt is not None and int(exit_cnt) > 0:
                 count_used = int(min(count_used, int(exit_cnt)))
@@ -333,7 +382,6 @@ def resolve_paper_trades(
                 count=int(count_used),
             )
 
-            # Sanity: max absolute pnl in dollars is count * $0.99
             max_abs = float(count_used) * 0.99
             if abs(float(pnl)) > (max_abs + 1e-6):
                 skipped += 1
@@ -346,60 +394,43 @@ def resolve_paper_trades(
                     )
                 continue
 
-            # Won/lost: for explicit exits we always classify (0 pnl => loss)
             won_val: int = 1 if float(pnl) > 0 else 0
 
-            # Optional: tag both rows for auditability
-            exit_tag = "exit_consumed:1"
-            exit_reason_tag = "exit_resolve_reason:explicit"
-            entry_tag = "exit_resolved:1"
+            # Tag entry + exit
+            entry_new_reasons = entry_reasons
+            for tg in (
+                "exit_resolved:1",
+                f"exit_id:{int(ex['id'])}",
+                f"exit_px_cents:{int(exit_px)}",
+                f"exit_cnt:{int(count_used)}",
+                f"exit_side:{held_side}",
+            ):
+                entry_new_reasons = _append_tag(entry_new_reasons, tg)
 
-            # Update entry (realized pnl + won + resolved_ts + tag)
+            exit_new_reasons = exit_reasons
+            for tg in ("exit_consumed:1", f"entry_id:{entry_id}", "exit_resolve_reason:explicit"):
+                exit_new_reasons = _append_tag(exit_new_reasons, tg)
+
             cur.execute(
                 """
                 UPDATE decisions
                 SET realized_pnl = ?,
                     won = ?,
                     resolved_ts = ?,
-                    reasons = CASE
-                        WHEN COALESCE(reasons,'') LIKE '%' || ? || '%'
-                        THEN COALESCE(reasons,'')
-                        ELSE COALESCE(reasons,'') || ';' || ?
-                    END
+                    reasons = ?
                 WHERE id = ?
                 """,
-                (float(pnl), int(won_val), now_iso, entry_tag, entry_tag, entry_id),
+                (float(pnl), int(won_val), now_iso, entry_new_reasons, entry_id),
             )
 
-            # Mark exit as consumed so it can't resolve multiple entries (and tag it)
             cur.execute(
                 """
                 UPDATE decisions
                 SET resolved_ts = ?,
-                    reasons = CASE
-                        WHEN COALESCE(reasons,'') LIKE '%' || ? || '%'
-                             AND COALESCE(reasons,'') LIKE '%' || ? || '%'
-                        THEN COALESCE(reasons,'')
-                        WHEN COALESCE(reasons,'') LIKE '%' || ? || '%'
-                        THEN COALESCE(reasons,'') || ';' || ?
-                        WHEN COALESCE(reasons,'') LIKE '%' || ? || '%'
-                        THEN COALESCE(reasons,'') || ';' || ?
-                        ELSE COALESCE(reasons,'') || ';' || ? || ';' || ?
-                    END
+                    reasons = ?
                 WHERE id = ?
                 """,
-                (
-                    now_iso,
-                    exit_tag,
-                    exit_reason_tag,
-                    exit_tag,
-                    exit_reason_tag,
-                    exit_reason_tag,
-                    exit_tag,
-                    exit_tag,
-                    exit_reason_tag,
-                    int(ex["id"]),
-                ),
+                (now_iso, exit_new_reasons, int(ex["id"])),
             )
 
             updated += 1
@@ -428,43 +459,6 @@ def resolve_paper_trades(
             (int(max_to_check),),
         ).fetchall()
 
-        flat_pnl_epsilon = 0.01  # don't label pennies as win/loss
-
-        def _safe_mark_yes_from_summary(s: dict) -> tuple[Optional[int], str]:
-            """
-            Return (mark_yes_cents, source).
-            Prefers mid_yes; falls back to avg(bid,ask); then bid; then ask.
-            """
-            mid = s.get("mid_yes_cents")
-            bid = s.get("yes_bid")
-            ask = s.get("yes_ask")
-
-            def _to_int(x) -> Optional[int]:
-                try:
-                    if x is None:
-                        return None
-                    v = int(round(float(x)))
-                    if 1 <= v <= 99:
-                        return v
-                except Exception:
-                    return None
-                return None
-
-            mid_i = _to_int(mid)
-            if mid_i is not None:
-                return mid_i, "mid_yes"
-
-            bid_i = _to_int(bid)
-            ask_i = _to_int(ask)
-
-            if bid_i is not None and ask_i is not None and ask_i >= bid_i:
-                return int(round((bid_i + ask_i) / 2.0)), "avg_bid_ask"
-            if bid_i is not None:
-                return bid_i, "bid_only"
-            if ask_i is not None:
-                return ask_i, "ask_only"
-            return None, "no_quote"
-
         for r in entry_rows:
             checked += 1
 
@@ -489,7 +483,7 @@ def resolve_paper_trades(
             entry_px = _extract_entry_price_cents(reasons)
             count = _extract_order_count(reasons)
 
-            if entry_px is None or count is None or count <= 0:
+            if entry_px is None or count is None or int(count) <= 0:
                 skipped += 1
                 continue
 
@@ -503,10 +497,11 @@ def resolve_paper_trades(
             yes_bid_i: Optional[int] = None
             yes_ask_i: Optional[int] = None
 
+            # Fetch mark
             try:
                 raw_market = client.get_market(str(ticker))
                 market_obj = raw_market
-                if isinstance(raw_market, dict) and "market" in raw_market and isinstance(raw_market["market"], dict):
+                if isinstance(raw_market, dict) and isinstance(raw_market.get("market"), dict):
                     market_obj = raw_market["market"]
 
                 s = summarize_market(market_obj)
@@ -536,17 +531,27 @@ def resolve_paper_trades(
                 if mark_yes_i is None:
                     raise RuntimeError("no_usable_mark_yes")
 
-                # Mark validity gate: reject degenerate quotes / untradable marks
+                # Mark validity gate: reject degenerate/untradable marks
                 unusable = False
+
+                # If we have a spread, require it reasonably tight
                 if spread_i is not None and int(spread_i) >= 30:
                     unusable = True
+
+                # Classic degenerate book: 0/100
                 if yes_bid_i == 0 and yes_ask_i == 100:
                     unusable = True
+
+                # If your summarize_market mid is 50 while spread is 100, it's degenerate
                 if mark_yes_i == 50 and spread_i == 100:
                     unusable = True
-                if status_s and status_s.lower() not in ("active", "open"):
-                    # If your summarize_market uses different status strings, adjust here.
-                    unusable = True
+
+                # Status gate: only reject if we are sure it's not tradable
+                # (keep this permissive to avoid false unusable)
+                if status_s and status_s.strip():
+                    st = status_s.strip().lower()
+                    if st in ("closed", "settled", "finalized", "resolved", "cancelled", "canceled"):
+                        unusable = True
 
                 if unusable:
                     mtm_reason = "unusable_quote"
@@ -558,6 +563,30 @@ def resolve_paper_trades(
                 mark_src = "fallback_zero"
                 mark_yes_i = None
 
+            # Delay policy for unusable quotes (do NOT resolve immediately)
+            if mtm_reason == "unusable_quote":
+                if age_min < float(unusable_defer_minutes):
+                    skipped += 1
+                    if logger:
+                        logger.info(
+                            "PaperResolver (MTM) defer unusable_quote "
+                            f"id={int(r['id'])} age_min={age_min:.1f} ticker={ticker} "
+                            f"status={status_s} spread={spread_i} bid={yes_bid_i} ask={yes_ask_i} mark_src={mark_src}"
+                        )
+                    continue
+
+                if age_min < float(unusable_force_resolve_minutes):
+                    skipped += 1
+                    if logger:
+                        logger.info(
+                            "PaperResolver (MTM) keep-defer unusable_quote "
+                            f"id={int(r['id'])} age_min={age_min:.1f} ticker={ticker} "
+                            f"status={status_s} spread={spread_i} bid={yes_bid_i} ask={yes_ask_i} mark_src={mark_src}"
+                        )
+                    continue
+                # else: fall through and force-resolve with pnl=0 + mtm_label:unusable_quote
+
+            # Compute MTM pnl
             if mark_yes_i is None:
                 pnl: float = 0.0
             else:
@@ -573,6 +602,7 @@ def resolve_paper_trades(
             except Exception:
                 pnl = 0.0
 
+            # Determine won flag (None if basically flat)
             if abs(pnl) < float(flat_pnl_epsilon):
                 won_val_db: Optional[int] = None
                 won_val_log: Optional[bool] = None
@@ -614,11 +644,9 @@ def resolve_paper_trades(
                     f"pnl={pnl:.4f} won={won_val_log} mtm_reason={mtm_reason}"
                 )
 
-        # commit everything
         con.commit()
 
     except Exception:
-        # If anything unexpected happens, rollback and re-raise (so caller sees failure)
         try:
             con.rollback()
         except Exception:

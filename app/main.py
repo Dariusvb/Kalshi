@@ -723,7 +723,7 @@ class BotApp:
             f"news_score_raw:{float(news.get('score', 0.0)):.2f}",
             f"news_score_eff:{float(news_applied.get('effective_news_score', 0.0)):.2f}",
             f"news_conf:{float(news.get('confidence', 0.0)):.2f}",
-            f"entry_price_cents:{int(exit_order['price_cents'])}",
+            f"exit_price_cents:{int(exit_order['price_cents'])}",
             f"exit_order_side:{exit_order['side']}",
             f"exit_yes_no:{exit_order['yes_no']}",
             f"exit_count:{int(exit_order['count'])}",

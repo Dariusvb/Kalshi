@@ -275,6 +275,8 @@ class BotApp:
         except Exception:
             return None
 
+        exit_pending = False
+
         for r in rows:
             if bool(r.get("dry_run", True)) != bool(self.settings.DRY_RUN):
                 continue
@@ -282,12 +284,29 @@ class BotApp:
                 continue
 
             action = str(r.get("action", "") or "")
+            reasons = str(r.get("reasons", "") or "")
+            resolved_ts = r.get("resolved_ts")
+
+            # Check for any exits recorded on this ticker
             if action.startswith("TRADE_EXIT"):
-                return None
+                exit_finalized = bool(resolved_ts) or ("exit_consumed:1" in reasons)
+                if exit_finalized:
+                    return None  # The position was definitively closed/resolved
+                else:
+                    exit_pending = True  # We found an exit order, but it hasn't resolved
+                continue
+
             if action not in {"TRADE_YES", "TRADE_NO"}:
                 continue
 
-            reasons = str(r.get("reasons", "") or "")
+            # It's an entry row. Let's see if it's considered "open".
+            if resolved_ts:
+                continue
+            if "exit_resolved:1" in reasons:
+                continue
+            if "mtm_label:" in reasons:
+                continue
+
             entry_px: Optional[int] = None
             count: Optional[int] = None
 
@@ -298,9 +317,6 @@ class BotApp:
                         entry_px = int(float(part.split(":", 1)[1].strip()))
                     except Exception:
                         pass
-                elif part.startswith("exit_count:"):
-                    # ignore exit metadata from other rows
-                    pass
                 elif part.startswith("order_count:"):
                     try:
                         count = int(float(part.split(":", 1)[1].strip()))
@@ -311,8 +327,6 @@ class BotApp:
             if not count or count <= 0:
                 stake = self._to_float(r.get("stake_dollars")) or 0.0
                 if entry_px and entry_px > 0:
-                    # $1 per contract payout scale -> cents to dollars
-                    # conservative estimate, minimum 1 if trade exists
                     try:
                         est = int(round((stake * 100.0) / float(entry_px)))
                         count = max(1, est)
@@ -323,16 +337,28 @@ class BotApp:
 
             opened_ts = r.get("ts")
             side = "YES" if action == "TRADE_YES" else "NO"
+            
+            # Grab actual DB ID to pair back
+            entry_id = r.get("id")
+            if entry_id is not None:
+                try:
+                    entry_id = int(entry_id)
+                except Exception:
+                    entry_id = None
+
             synthetic = {
                 "ticker": ticker,
                 "yes_no": side,
                 "count": int(max(1, count)),
                 "entry_price_cents": entry_px,
                 "opened_at": opened_ts,
+                "entry_id": entry_id,
                 "_synthetic_from_decisions": True,
+                "_exit_pending": exit_pending
             }
             self.logger.info(
-                f"Synthetic DRY_RUN position inferred for {ticker}: side={side} count={synthetic['count']}"
+                f"Synthetic DRY_RUN position inferred for {ticker}: side={side} "
+                f"count={synthetic['count']} entry_id={entry_id} exit_pending={exit_pending}"
             )
             return synthetic
 
@@ -356,6 +382,40 @@ class BotApp:
 
         # DRY_RUN fallback if API doesn't expose simulated positions
         return self._synthetic_open_position_from_decisions(ticker)
+
+    def _latest_unresolved_entry_id_for_ticker(self, ticker: str) -> Optional[int]:
+        """
+        Helper: finds the specific DB `id` of the last relevant, unresolved entry trade.
+        """
+        try:
+            rows = self.store.recent_decisions(250)
+        except Exception:
+            return None
+
+        for r in rows:
+            if bool(r.get("dry_run", True)) != bool(self.settings.DRY_RUN):
+                continue
+            if str(r.get("ticker", "")) != str(ticker):
+                continue
+            
+            action = str(r.get("action", ""))
+            if action not in {"TRADE_YES", "TRADE_NO"}:
+                continue
+
+            if r.get("resolved_ts"):
+                continue
+            
+            reasons = str(r.get("reasons", "") or "")
+            if "exit_resolved:1" in reasons:
+                continue
+
+            entry_id = r.get("id")
+            if entry_id is not None:
+                try:
+                    return int(entry_id)
+                except Exception:
+                    pass
+        return None
 
     def _latest_entry_context_for_ticker(self, ticker: str) -> dict:
         """
@@ -710,10 +770,21 @@ class BotApp:
         if not pos:
             return False
 
+        if pos.get("_exit_pending"):
+            self.logger.info(f"EXIT skip {chosen['ticker']} | pending exit order is already present")
+            return False
+
         exit_order = self._build_conservative_exit_order(chosen, pos)
         if not exit_order:
             self.logger.info(f"EXIT skip {chosen['ticker']} | could not build exit order from position payload")
             return False
+
+        # Attempt pairing with explicitly tied entry decision ID
+        entry_id = None
+        if pos.get("_synthetic_from_decisions") and pos.get("entry_id") is not None:
+            entry_id = pos.get("entry_id")
+        else:
+            entry_id = self._latest_unresolved_entry_id_for_ticker(str(chosen.get("ticker")))
 
         exit_action = f"TRADE_EXIT_{exit_order['held_side']}"
         reasons = list(getattr(sig, "reasons", [])) + [
@@ -728,6 +799,9 @@ class BotApp:
             f"exit_yes_no:{exit_order['yes_no']}",
             f"exit_count:{int(exit_order['count'])}",
         ] + exit_reasons
+
+        if entry_id is not None:
+            reasons.append(f"entry_id:{entry_id}")
 
         action = "SKIP"
         try:

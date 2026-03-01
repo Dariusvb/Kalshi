@@ -170,12 +170,7 @@ class BotApp:
 
     def _extract_positions_list(self, payload: Any) -> list[dict]:
         """
-        Normalize multiple possible position payload layouts from client/API:
-
-        - {"positions": [...]}
-        - {"market_positions": [...]}
-        - {"event_positions": [...]}
-        - raw list [...]
+        Normalize multiple possible position payload layouts from client/API.
         """
         if isinstance(payload, dict):
             for key in ("positions", "market_positions", "event_positions"):
@@ -183,7 +178,6 @@ class BotApp:
                 if isinstance(p, list):
                     return [x for x in p if isinstance(x, dict)]
 
-            # some APIs nest one level deeper
             for outer in ("data", "result", "response"):
                 nested = payload.get(outer)
                 if isinstance(nested, dict):
@@ -204,10 +198,6 @@ class BotApp:
         return ""
 
     def _position_contract_side(self, p: dict) -> Optional[str]:
-        """
-        Normalize position side to 'YES' or 'NO' if possible.
-        Accepts several likely payload variants.
-        """
         for k in ("yes_no", "side", "position_side", "contract_side", "outcome"):
             v = p.get(k)
             if v is None:
@@ -218,7 +208,6 @@ class BotApp:
             if s in {"NO", "N"}:
                 return "NO"
 
-        # Some payloads expose counts split by side
         yes_qty = self._to_float(p.get("yes_count") or p.get("yes_position") or p.get("yes_contracts"))
         no_qty = self._to_float(p.get("no_count") or p.get("no_position") or p.get("no_contracts"))
         if yes_qty and yes_qty > 0 and (not no_qty or no_qty <= 0):
@@ -232,7 +221,6 @@ class BotApp:
             v = self._to_float(p.get(k))
             if v is not None and v > 0:
                 return max(0, int(round(v)))
-        # Side-specific fallbacks
         for k in ("yes_count", "yes_contracts", "yes_position", "no_count", "no_contracts", "no_position"):
             v = self._to_float(p.get(k))
             if v is not None and v > 0:
@@ -261,107 +249,99 @@ class BotApp:
                 continue
         return None
 
-    def _synthetic_open_position_from_decisions(self, ticker: str) -> Optional[dict]:
+    def _synthetic_open_positions_from_decisions(self) -> list[dict]:
         """
-        DRY_RUN fallback only:
-        If the API position endpoint doesn't report simulated positions, derive a best-effort
-        open position from recent decision rows so exit pipeline can be validated.
+        DRY_RUN only: Builds a list of all unresolved synthetic entries.
         """
         if not bool(self.settings.DRY_RUN):
-            return None
+            return []
 
         try:
-            rows = self.store.recent_decisions(400)
+            rows = self.store.recent_decisions(1000)
         except Exception:
-            return None
+            return []
 
-        exit_pending = False
-
-        for r in rows:
+        open_pos = {}
+        
+        # Reverse to replay state oldest to newest
+        for r in reversed(rows):
             if bool(r.get("dry_run", True)) != bool(self.settings.DRY_RUN):
                 continue
-            if str(r.get("ticker", "")) != str(ticker):
+
+            ticker = str(r.get("ticker", ""))
+            if not ticker:
                 continue
 
             action = str(r.get("action", "") or "")
             reasons = str(r.get("reasons", "") or "")
-            resolved_ts = r.get("resolved_ts")
 
-            # Check for any exits recorded on this ticker
             if action.startswith("TRADE_EXIT"):
-                exit_finalized = bool(resolved_ts) or ("exit_consumed:1" in reasons)
-                if exit_finalized:
-                    return None  # The position was definitively closed/resolved
-                else:
-                    exit_pending = True  # We found an exit order, but it hasn't resolved
+                exit_finalized = bool(r.get("resolved_ts")) or ("exit_consumed:1" in reasons)
+                if ticker in open_pos:
+                    if exit_finalized:
+                        del open_pos[ticker]
+                    else:
+                        open_pos[ticker]["_exit_pending"] = True
                 continue
 
-            if action not in {"TRADE_YES", "TRADE_NO"}:
-                continue
+            if action in {"TRADE_YES", "TRADE_NO"}:
+                if r.get("resolved_ts") or "exit_resolved:1" in reasons or "mtm_label:" in reasons:
+                    if ticker in open_pos:
+                        del open_pos[ticker]
+                    continue
 
-            # It's an entry row. Let's see if it's considered "open".
-            if resolved_ts:
-                continue
-            if "exit_resolved:1" in reasons:
-                continue
-            if "mtm_label:" in reasons:
-                continue
+                entry_px = None
+                count = None
+                for part in reasons.split(";"):
+                    part = part.strip()
+                    if part.startswith("entry_price_cents:"):
+                        try:
+                            entry_px = int(float(part.split(":", 1)[1].strip()))
+                        except Exception:
+                            pass
+                    elif part.startswith("order_count:"):
+                        try:
+                            count = int(float(part.split(":", 1)[1].strip()))
+                        except Exception:
+                            pass
 
-            entry_px: Optional[int] = None
-            count: Optional[int] = None
-
-            for part in reasons.split(";"):
-                part = part.strip()
-                if part.startswith("entry_price_cents:"):
-                    try:
-                        entry_px = int(float(part.split(":", 1)[1].strip()))
-                    except Exception:
-                        pass
-                elif part.startswith("order_count:"):
-                    try:
-                        count = int(float(part.split(":", 1)[1].strip()))
-                    except Exception:
-                        pass
-
-            # fallback count estimate from stake/price if not explicitly logged
-            if not count or count <= 0:
-                stake = self._to_float(r.get("stake_dollars")) or 0.0
-                if entry_px and entry_px > 0:
-                    try:
-                        est = int(round((stake * 100.0) / float(entry_px)))
-                        count = max(1, est)
-                    except Exception:
+                if not count or count <= 0:
+                    stake = self._to_float(r.get("stake_dollars")) or 0.0
+                    if entry_px and entry_px > 0:
+                        try:
+                            count = max(1, int(round((stake * 100.0) / float(entry_px))))
+                        except Exception:
+                            count = 1
+                    else:
                         count = 1
-                else:
-                    count = 1
 
-            opened_ts = r.get("ts")
-            side = "YES" if action == "TRADE_YES" else "NO"
-            
-            # Grab actual DB ID to pair back
-            entry_id = r.get("id")
-            if entry_id is not None:
-                try:
-                    entry_id = int(entry_id)
-                except Exception:
-                    entry_id = None
+                entry_id = r.get("id")
+                if entry_id is not None:
+                    try:
+                        entry_id = int(entry_id)
+                    except Exception:
+                        entry_id = None
 
-            synthetic = {
-                "ticker": ticker,
-                "yes_no": side,
-                "count": int(max(1, count)),
-                "entry_price_cents": entry_px,
-                "opened_at": opened_ts,
-                "entry_id": entry_id,
-                "_synthetic_from_decisions": True,
-                "_exit_pending": exit_pending
-            }
-            self.logger.info(
-                f"Synthetic DRY_RUN position inferred for {ticker}: side={side} "
-                f"count={synthetic['count']} entry_id={entry_id} exit_pending={exit_pending}"
-            )
-            return synthetic
+                open_pos[ticker] = {
+                    "ticker": ticker,
+                    "yes_no": "YES" if action == "TRADE_YES" else "NO",
+                    "count": int(max(1, count)),
+                    "entry_price_cents": entry_px,
+                    "opened_at": r.get("ts"),
+                    "entry_id": entry_id,
+                    "_synthetic_from_decisions": True,
+                    "_exit_pending": False
+                }
 
+        return list(open_pos.values())
+
+    def _synthetic_open_position_from_decisions(self, ticker: str) -> Optional[dict]:
+        """
+        DRY_RUN fallback only: Single ticker lookup for existing flows.
+        """
+        for pos in self._synthetic_open_positions_from_decisions():
+            if pos["ticker"] == ticker:
+                return pos
         return None
 
     def _find_open_position_for_ticker(self, ticker: str) -> Optional[dict]:
@@ -384,9 +364,6 @@ class BotApp:
         return self._synthetic_open_position_from_decisions(ticker)
 
     def _latest_unresolved_entry_id_for_ticker(self, ticker: str) -> Optional[int]:
-        """
-        Helper: finds the specific DB `id` of the last relevant, unresolved entry trade.
-        """
         try:
             rows = self.store.recent_decisions(250)
         except Exception:
@@ -418,9 +395,6 @@ class BotApp:
         return None
 
     def _latest_entry_context_for_ticker(self, ticker: str) -> dict:
-        """
-        Best-effort lookup of last entry trade recorded for this ticker in current mode.
-        """
         out = {
             "entry_conviction": None,
             "entry_ts": None,
@@ -471,10 +445,6 @@ class BotApp:
             return None
 
     def _build_conservative_exit_order(self, chosen: dict, pos: dict) -> Optional[dict]:
-        """
-        Build a simple exit order by SELLING the held contract side at (best bid if available),
-        with safe fallbacks. Conservative and minimal to avoid breaking entry flow.
-        """
         side = self._position_contract_side(pos)
         count = self._position_count(pos)
         if side not in {"YES", "NO"} or count <= 0:
@@ -483,14 +453,12 @@ class BotApp:
         yes_bid = self._to_float(chosen.get("yes_bid")) or 0.0
         yes_ask = self._to_float(chosen.get("yes_ask")) or 0.0
         no_bid = self._to_float(chosen.get("no_bid")) or 0.0
-        no_ask = self._to_float(chosen.get("no_ask")) or 0.0
         mid = self._to_float(chosen.get("mid_yes_cents")) or 50.0
 
         if side == "YES":
             px = int(round(yes_bid)) if yes_bid > 0 else int(max(1, min(99, round(mid) - 1)))
             yes_no = "yes"
         else:
-            # Prefer explicit no_bid; otherwise infer from yes_ask if present
             if no_bid > 0:
                 px = int(round(no_bid))
             elif yes_ask > 0:
@@ -519,9 +487,6 @@ class BotApp:
         news: dict,
         news_applied: dict,
     ) -> tuple[bool, list[str]]:
-        """
-        Conservative exit: only when thesis materially deteriorates.
-        """
         if not self.exit_management_enabled:
             return False, ["exit_mgmt_disabled"]
 
@@ -534,7 +499,6 @@ class BotApp:
         if held_side not in {"YES", "NO"} or held_count <= 0:
             return False, ["position_unparseable"]
 
-        # Hold-time guard (prefer position timestamp, fallback to DB entry ts)
         held_minutes: Optional[float] = None
         p_opened = self._position_open_ts(pos)
         if p_opened is not None:
@@ -566,7 +530,6 @@ class BotApp:
             entry_conv is not None and (entry_conv - final_conv) >= float(self.exit_conviction_drop_points)
         )
 
-        # Strong adverse news (only if high confidence and meaningfully adverse)
         news_conf = float(news.get("confidence", 0.0) or 0.0)
         eff_news = float(news_applied.get("effective_news_score", 0.0) or 0.0)
         strong_adverse_news = (
@@ -583,9 +546,6 @@ class BotApp:
             f"exit_strong_adverse_news:{1 if strong_adverse_news else 0}",
         ])
 
-        # Conservative rule:
-        # - opposite signal OR (skip+weak conviction)
-        # - and additionally conviction collapse OR strong adverse news OR opposite signal itself
         if self.exit_require_opposite_or_skip:
             if not (opposite_signal or weak_or_skip):
                 return False, reasons
@@ -601,12 +561,6 @@ class BotApp:
     # DRY_RUN pipeline validation helpers
     # -----------------------------
     def _should_force_pipeline_test_entry(self, *, sig: Any, chosen: dict) -> bool:
-        """
-        Allow a small number of DRY_RUN test entries even when the strategy/risk path skips,
-        so the full entry -> position read -> exit pipeline can be validated safely.
-
-        Live mode is never affected.
-        """
         if not bool(self.settings.DRY_RUN):
             return False
         if not self.pipeline_test_entries_enabled:
@@ -616,11 +570,9 @@ class BotApp:
         if self._pipeline_test_entries_sent >= int(self.pipeline_test_max_entries):
             return False
 
-        # Don't force if strategy already wants to trade normally
         if str(getattr(sig, "direction", "SKIP") or "SKIP").upper() != "SKIP":
             return False
 
-        # Avoid forcing if an open position already exists for chosen ticker
         try:
             existing = self._find_open_position_for_ticker(str(chosen.get("ticker")))
             if existing:
@@ -628,7 +580,6 @@ class BotApp:
         except Exception:
             pass
 
-        # Tick spacing guard to avoid rapid spam
         if self._pipeline_test_last_entry_tick is not None:
             delta = int(self._tick_count) - int(self._pipeline_test_last_entry_tick)
             if delta < int(self.pipeline_test_min_ticks_between):
@@ -637,10 +588,6 @@ class BotApp:
         return True
 
     def _build_pipeline_test_order(self, chosen: dict) -> Optional[dict]:
-        """
-        Build a tiny DRY_RUN-only YES buy order using current quote data.
-        This bypasses strategy/risk only for test validation and preserves live behavior.
-        """
         if not bool(self.settings.DRY_RUN):
             return None
 
@@ -648,7 +595,6 @@ class BotApp:
         yes_bid = self._to_float(chosen.get("yes_bid")) or 0.0
         mid = self._to_float(chosen.get("mid_yes_cents")) or 50.0
 
-        # Use conservative buy price near ask if available; safe fallbacks otherwise
         if yes_ask > 0:
             px = int(round(yes_ask))
         elif yes_bid > 0:
@@ -656,7 +602,6 @@ class BotApp:
         else:
             px = int(min(99, max(1, round(mid))))
 
-        # Minimal test size (try 1 contract). Let client reject if not possible.
         count = 1
 
         return {
@@ -667,6 +612,121 @@ class BotApp:
             "price_cents": int(max(1, min(99, px))),
             "client_order_id": f"ptest-{chosen['ticker']}-{int(dt.datetime.now(dt.UTC).timestamp())}",
         }
+
+    def _do_dry_run_exit_test_pass(self, now: str) -> None:
+        """
+        DRY_RUN-only forced exits pass for any unresolved synthetic entries.
+        """
+        if not self.settings.DRY_RUN:
+            return
+
+        open_positions = self._synthetic_open_positions_from_decisions()
+        if not open_positions:
+            return
+
+        processed = 0
+        for pos in open_positions:
+            if processed >= 2:  # Process up to 2 positions per tick to avoid flooding
+                break
+                
+            if pos.get("_exit_pending"):
+                continue
+
+            mins = self._minutes_since(pos.get("opened_at"))
+            if mins is None or mins < 2.0:
+                continue
+
+            ticker = pos["ticker"]
+            
+            # Fetch fresh quote
+            m = None
+            try:
+                # Assuming base client supports get_market by ticker natively
+                raw = getattr(self.client, "get_market", lambda t: None)(ticker)
+                if raw:
+                    m = summarize_market(raw)
+            except Exception:
+                pass
+                
+            if not m:
+                # Fallback to get_markets array
+                try:
+                    raw_list = self.client.get_markets(limit=50)
+                    for x in extract_markets(raw_list):
+                        if str(x.get("ticker")) == ticker:
+                            m = summarize_market(x)
+                            break
+                except Exception:
+                    pass
+
+            if not m:
+                continue
+                
+            # Build basic reverse order
+            side = pos["yes_no"]
+            yes_bid = self._to_float(m.get("yes_bid")) or 0.0
+            yes_ask = self._to_float(m.get("yes_ask")) or 0.0
+            no_bid = self._to_float(m.get("no_bid")) or 0.0
+            mid = self._to_float(m.get("mid_yes_cents")) or 50.0
+
+            if side == "YES":
+                px = int(round(yes_bid)) if yes_bid > 0 else int(max(1, min(99, round(mid) - 1)))
+                yes_no = "yes"
+            else:
+                if no_bid > 0:
+                    px = int(round(no_bid))
+                elif yes_ask > 0:
+                    px = int(max(1, min(99, round(100 - yes_ask))))
+                else:
+                    px = int(max(1, min(99, round((100 - mid) - 1))))
+                yes_no = "no"
+
+            exit_order = {
+                "ticker": ticker,
+                "side": "sell",
+                "yes_no": yes_no,
+                "count": int(pos["count"]),
+                "price_cents": int(max(1, min(99, px))),
+                "client_order_id": f"xtest-{ticker}-{int(dt.datetime.now(dt.UTC).timestamp())}",
+            }
+
+            try:
+                self.client.place_order(**exit_order)
+                action = f"TRADE_EXIT_{side}"
+                self.logger.info(f"DRY_RUN forced exit test fired for {ticker} (entry_id: {pos.get('entry_id')})")
+            except KalshiAPIError as e:
+                action = "ERROR"
+                self.logger.warning(f"Exit test order error for {ticker}: {e}")
+
+            entry_id = pos.get("entry_id")
+            reasons = [
+                "exit_test:1",
+                f"exit_price_cents:{exit_order['price_cents']}",
+                f"exit_order_side:{exit_order['side']}",
+                f"exit_yes_no:{exit_order['yes_no']}",
+                f"exit_count:{exit_order['count']}",
+            ]
+            if entry_id is not None:
+                reasons.append(f"entry_id:{entry_id}")
+
+            row = {
+                "ts": now,
+                "ticker": ticker,
+                "direction": "SKIP",
+                "base_conviction": 0.0,
+                "social_bonus": 0.0,
+                "final_conviction": 0.0,
+                "stake_dollars": 0.0,
+                "action": action,
+                "reasons": ";".join(reasons),
+                "dry_run": self.settings.DRY_RUN,
+                "realized_pnl": None,
+                "won": None,
+                "resolved_ts": None,
+                "market_category": m.get("category"),
+            }
+            self._record_decision_row(row)
+            processed += 1
 
     def _record_decision_row(self, row: dict) -> Optional[int]:
         inserted_id: Optional[int] = None
@@ -752,10 +812,6 @@ class BotApp:
         news_applied: dict,
         final_conviction: float,
     ) -> bool:
-        """
-        Best-effort thesis deterioration exit for an already-open position in the *currently chosen* ticker.
-        Returns True if an exit trade/error row was recorded (to avoid entry+exit churn same tick).
-        """
         should_exit, exit_reasons = self._should_exit_on_thesis_deterioration(
             chosen=chosen,
             sig=sig,
@@ -779,7 +835,6 @@ class BotApp:
             self.logger.info(f"EXIT skip {chosen['ticker']} | could not build exit order from position payload")
             return False
 
-        # Attempt pairing with explicitly tied entry decision ID
         entry_id = None
         if pos.get("_synthetic_from_decisions") and pos.get("entry_id") is not None:
             entry_id = pos.get("entry_id")
@@ -835,7 +890,7 @@ class BotApp:
             "base_conviction": float(getattr(sig, "conviction_score", 0.0)),
             "social_bonus": float(getattr(social, "bonus_score", 0.0)),
             "final_conviction": float(final_conviction),
-            "stake_dollars": 0.0,  # exits tracked by contract count; keep stake neutral for PnL stats compatibility
+            "stake_dollars": 0.0,
             "action": action,
             "reasons": ";".join(reasons),
             "dry_run": self.settings.DRY_RUN,
@@ -853,17 +908,6 @@ class BotApp:
         return True
 
     def _fetch_market_universe(self, pages: int = 5, page_limit: int = 100) -> list[dict]:
-        """
-        Fetch multiple pages of markets and build a tradeable universe before _choose_market() ranking.
-
-        Preference order:
-        1) non-MVE + non-provisional + quote-usable (best fit for current strategy)
-        2) if none exist in fetched pages, fall back to quote-quality-filtered MVE markets
-
-        Notes:
-        - Requires KalshiClient.get_markets(..., cursor=...) support (falls back gracefully if missing).
-        - MVE markets have dominated the feed in practice; fallback mode prevents the bot from stalling.
-        """
         cursor: Optional[str] = None
         pages_fetched = 0
 
@@ -877,18 +921,15 @@ class BotApp:
         preferred_non_mve: list[dict] = []
         mve_fallback_candidates: list[dict] = []
 
-        # Relaxed-but-not-crazy fallback thresholds for MVE-dominated feeds
         fallback_min_mid = 3.0
         fallback_max_mid = 97.0
-        fallback_min_volume = 0.0  # allow fresh markets
-        fallback_require_at_least_one_side = True  # bid>0 OR ask>0
+        fallback_min_volume = 0.0
+        fallback_require_at_least_one_side = True
 
         for _ in range(max(1, int(pages))):
             try:
-                # Preferred path (patched client supports cursor)
                 raw = self.client.get_markets(limit=int(page_limit), cursor=cursor)
             except TypeError:
-                # Backward compatibility if client hasn't been patched yet
                 raw = self.client.get_markets(limit=int(page_limit))
 
             page_markets = extract_markets(raw)
@@ -911,11 +952,9 @@ class BotApp:
                 is_mve = ticker.startswith("KXMVESPORTSMULTIGAMEEXTENDED") or bool(m.get("mve_collection_ticker"))
                 is_provisional = bool(m.get("is_provisional"))
 
-                # Summarize once so we can evaluate fallback quote quality
                 try:
                     s = summarize_market(m)
                 except Exception:
-                    # If summary fails, skip quietly from universe construction
                     continue
 
                 status_ok = str(s.get("status", "")).lower() in {"active", "open", "trading", "unknown"}
@@ -925,7 +964,6 @@ class BotApp:
                 yes_bid = float(s.get("yes_bid", 0) or 0)
                 yes_ask = float(s.get("yes_ask", 0) or 0)
 
-                # Standard preferred gate (matches chooser behavior)
                 quote_ok_standard = (
                     status_ok
                     and spread > 0
@@ -935,7 +973,6 @@ class BotApp:
                     and vol >= float(self.settings.MIN_RECENT_VOLUME)
                 )
 
-                # Relaxed MVE fallback gate for current feed conditions
                 one_side_ok = (yes_bid > 0 or yes_ask > 0) if fallback_require_at_least_one_side else True
                 quote_ok_for_mve_fallback = (
                     status_ok
@@ -961,14 +998,12 @@ class BotApp:
                 else:
                     dropped_preferred_quote += 1
 
-            # Stop if no pagination cursor exists (or raw isn't dict-like)
             if not isinstance(raw, dict):
                 break
             cursor = raw.get("cursor")
             if not cursor:
                 break
 
-            # Early stop if we already built a healthy preferred universe
             if len(preferred_non_mve) >= 150:
                 break
 
@@ -987,7 +1022,6 @@ class BotApp:
             )
             return preferred_non_mve
 
-        # Fallback mode: feed is MVE-dominated, so return only quote-quality MVE names
         if mve_fallback_candidates:
             ranked = []
             for m in mve_fallback_candidates:
@@ -1031,19 +1065,8 @@ class BotApp:
         return []
 
     def _choose_market(self, markets: list[dict]) -> Any:
-        """
-        Choose the best market summary from the fetched universe.
-
-        Strategy:
-        1) strict path (existing behavior)
-        2) relaxed fallback path for MVE/one-sided quote conditions
-           - still requires valid status + some quote signal
-           - applies an effective spread penalty to low-quality quotes
-           - avoids ultra-extreme tails that almost always become signal SKIPs
-        """
         ok_status = {"active", "open", "trading", "unknown"}
 
-        # --- Strict path (original behavior) ---
         strict_candidates: list[dict] = []
         for m in markets[:200]:
             try:
@@ -1079,15 +1102,12 @@ class BotApp:
         if strict_candidates:
             return strict_candidates[0]
 
-        # --- Relaxed fallback path ---
         relaxed_candidates: list[dict] = []
         max_relaxed_spread = max(
             float(self.settings.MAX_SPREAD_CENTS) * 2.0,
             float(self.settings.MAX_SPREAD_CENTS) + 5.0,
         )
 
-        # Prefer higher-probability markets; avoid ultra-cheap tails.
-        # Keep aligned with signal_engine YES/NO floors (default 15c).
         relaxed_mid_floor = 15.0
         relaxed_mid_ceiling = 85.0
 
@@ -1106,25 +1126,19 @@ class BotApp:
             yes_bid = float(s.get("yes_bid", 0) or 0)
             yes_ask = float(s.get("yes_ask", 0) or 0)
 
-            # Require at least some quote signal
             if yes_bid <= 0 and yes_ask <= 0 and mid <= 0:
                 continue
-
-            # Avoid broken quotes
             if mid and (mid <= 1 or mid >= 99):
                 continue
-
-            # NEW: relaxed-mode tail guard (prevents selecting markets your signal almost always skips)
             if mid and (mid < relaxed_mid_floor or mid > relaxed_mid_ceiling):
                 continue
 
-            # Use reported spread if usable; otherwise infer; otherwise heavily penalize one-sided quotes
             if spread > 0:
                 effective_spread = spread
             elif yes_bid > 0 and yes_ask > 0 and yes_ask >= yes_bid:
                 effective_spread = yes_ask - yes_bid
             else:
-                effective_spread = 99.0  # one-sided quote penalty
+                effective_spread = 99.0
 
             if effective_spread > max_relaxed_spread:
                 continue
@@ -1239,22 +1253,10 @@ class BotApp:
 
         return (wins / counted) if counted > 0 else None, counted
 
-    # -----------------------------
-    # News / scorecard helpers
-    # -----------------------------
     def _news_category_allowlist(self) -> list[str]:
-        # Keep this conservative; you can widen later once you trust query quality.
         return ["politics", "weather", "sports", "macro"]
 
     def _fetch_news_items_for_market(self, chosen: dict) -> list[dict]:
-        """
-        Real news adapter:
-        - builds query from market label/title/question
-        - fetches items via app/news_fetch.py
-        - uses self.news_cache (your NewsCache class) if available
-        - infers direction_hint + strength so evaluate_news_signal() can work
-        """
-        # ---- Import news_fetch (required for this path) ----
         try:
             from app.news_fetch import (
                 build_news_query_from_market_label,
@@ -1266,7 +1268,6 @@ class BotApp:
             self.logger.warning(f"News fetch module unavailable: {e}")
             return []
 
-        # ---- Choose the best label we have ----
         label = str(
             chosen.get("market_label")
             or chosen.get("title")
@@ -1280,23 +1281,18 @@ class BotApp:
         if not label:
             return []
 
-        # ---- Build query ----
         query = build_news_query_from_market_label(label)
         if not query:
             return []
         
-        # ✅ One-liner log (paste-over requested)
         self.logger.info(f"News query='{query}' | label='{label[:120]}' | ticker={chosen.get('ticker')}")
         
-        # ---- Cache (your NewsCache: seen_recently/mark_seen) ----
         cache = getattr(self, "news_cache", None)
 
-        # ---- Fetch RSS ----
         raw_items = fetch_google_news_rss(query, max_items=12, timeout=6.0)
         if not raw_items:
             return []
 
-        # ---- Infer YES/NO meaning from wording & add direction_hint/strength ----
         y_is_event = yes_means_event_occurs(label)
 
         out: list[dict] = []
@@ -1304,7 +1300,6 @@ class BotApp:
             if not isinstance(it, dict):
                 continue
 
-            # If we have a cache, skip items we've already processed recently
             if cache is not None:
                 try:
                     if cache.seen_recently(it):
@@ -1312,7 +1307,6 @@ class BotApp:
                 except Exception:
                     pass
 
-            # Add direction_hint/strength (best effort)
             try:
                 enriched = infer_direction_hint(it, yes_means_event_occurs=y_is_event)
             except Exception:
@@ -1320,7 +1314,6 @@ class BotApp:
 
             out.append(enriched)
 
-            # Mark as seen after accepting
             if cache is not None:
                 try:
                     cache.mark_seen(it)
@@ -1394,36 +1387,25 @@ class BotApp:
         social_bonus: float,
         news: dict,
     ) -> tuple[float, dict]:
-        """
-        Convert raw news score into an *effective* conviction adjustment.
-
-        Design goals:
-        - news should help, not dominate
-        - low-confidence/noisy news should barely move anything
-        - conflicting news should dampen, not hijack, by default
-        """
         raw_news_score = float(news.get("score", 0.0))
         news_conf = max(0.0, min(1.0, float(news.get("confidence", 0.0))))
         news_regime = str(news.get("regime", "unavailable"))
         sig_dir = str(base_signal_direction or "SKIP").upper()
 
-        # Confidence scaling with floor
         if news_conf <= self.news_min_confidence_to_apply:
-            conf_scale = 0.10  # tiny effect, not zero (useful for logging/experiments)
+            conf_scale = 0.10
         elif news_conf >= self.news_full_confidence_at:
             conf_scale = 1.00
         else:
             span = max(1e-9, self.news_full_confidence_at - self.news_min_confidence_to_apply)
             conf_scale = 0.10 + 0.90 * ((news_conf - self.news_min_confidence_to_apply) / span)
 
-        # Regime scaling
         regime_scale = 1.0
         if news_regime in {"noisy_or_weak", "unavailable", "disabled", "error_fallback"}:
             regime_scale = self.news_neutral_regime_multiplier
         elif news_regime in {"mixed"}:
             regime_scale = self.news_mixed_regime_multiplier
 
-        # Directional compatibility check (raw news score >0 implies YES-ish; <0 implies NO-ish)
         conflict = False
         if sig_dir == "YES" and raw_news_score < 0:
             conflict = True
@@ -1434,12 +1416,9 @@ class BotApp:
 
         effective_news_score = raw_news_score * conf_scale * regime_scale * direction_scale
 
-        # Optional safety: do not allow news to push conviction so far that it effectively flips a borderline setup
         if (not self.news_allow_direction_flip) and conflict:
-            # Clamp conflicting contribution more aggressively
             effective_news_score = max(-2.0, min(2.0, effective_news_score))
 
-        # Final cap on conviction impact
         effective_news_score = max(
             -self.news_abs_effect_cap_on_conviction,
             min(self.news_abs_effect_cap_on_conviction, effective_news_score),
@@ -1525,11 +1504,9 @@ class BotApp:
         self._tick_count += 1
         now = dt.datetime.now(dt.UTC).isoformat()
 
-        # Preferred path: broader + cleaner universe
         markets = self._fetch_market_universe(pages=5, page_limit=100)
         self.logger.info(f"Fetched filtered market universe: {len(markets)}")
 
-        # Fallback path: preserve old behavior if filtered universe is empty
         if not markets:
             self.logger.warning("Filtered universe empty; falling back to single-page raw markets.")
             raw = self.client.get_markets(limit=100)
@@ -1546,6 +1523,10 @@ class BotApp:
             recent = self.store.recent_decisions(80)
             self._maybe_send_periodic_summary(snapshot, recent)
             self._maybe_send_scorecard_summary()
+            
+            # Allow the global dry-run exit pass even if no current candidate was chosen
+            if self.settings.DRY_RUN:
+                self._do_dry_run_exit_test_pass(now)
             return
 
         market_label = str(chosen.get("market_label") or chosen.get("title") or chosen.get("question") or "").strip()
@@ -1593,7 +1574,6 @@ class BotApp:
             f"reasons={news['reasons']} flags={news['risk_flags']}"
         )
 
-        # Apply news safely (confidence + regime + direction aware)
         final_conviction, news_applied = self._apply_news_to_conviction(
             base_signal_direction=sig.direction,
             base_conviction=float(sig.conviction_score),
@@ -1610,10 +1590,6 @@ class BotApp:
 
         snapshot = self._fetch_portfolio_snapshot()
 
-        # -----------------------------
-        # Conservative thesis-deterioration exit management
-        # Only applies if an open position exists in the chosen ticker.
-        # -----------------------------
         try:
             exited = self._maybe_manage_exit_for_chosen(
                 now=now,
@@ -1625,8 +1601,12 @@ class BotApp:
                 final_conviction=final_conviction,
             )
             if exited:
-                # refresh snapshot post-exit attempt for summaries/alerts
                 snapshot = self._fetch_portfolio_snapshot()
+                
+                # Allow the global dry-run exit pass
+                if self.settings.DRY_RUN:
+                    self._do_dry_run_exit_test_pass(now)
+                
                 self._post_tick_housekeeping(snapshot)
                 return
         except Exception as e:
@@ -1684,7 +1664,6 @@ class BotApp:
             f"news_conflict_sig:{1 if news_applied.get('news_conflicts_signal') else 0}",
         ]
         
-        # Helpful always-on diagnostics for direction bias
         try:
             my = float(chosen.get("mid_yes_cents", 0.0) or 0.0)
             reasons.append(f"mid_yes_cents:{my:.2f}")
@@ -1702,9 +1681,6 @@ class BotApp:
             reasons.append(f"risk_gate_wr:{recent_win_rate_for_gate:.3f}")
             reasons.append(f"risk_gate_wr_n:{winrate_sample}")
 
-        # -----------------------------
-        # Guard: Prevent hammering the same ticker
-        # -----------------------------
         force_guard_skip = False
         if getattr(sig, "direction", "SKIP") != "SKIP":
             if self._find_open_position_for_ticker(str(chosen["ticker"])):
@@ -1716,10 +1692,6 @@ class BotApp:
                 except AttributeError:
                     pass
 
-        # -----------------------------
-        # DRY_RUN-only pipeline test entry (bounded, safe)
-        # Does not alter live behavior or strategy logic.
-        # -----------------------------
         forced_pipeline_test = False
         pipeline_test_order = None
 
@@ -1741,7 +1713,6 @@ class BotApp:
         should_enter_test = bool(forced_pipeline_test and pipeline_test_order is not None)
 
         if should_enter_normal or should_enter_test:
-            # --- Build the order first ---
             if should_enter_test:
                 order = pipeline_test_order
                 used_direction = "YES"
@@ -1752,7 +1723,6 @@ class BotApp:
                 used_direction = str(sig.direction)
                 used_stake_dollars = float(risk.stake_dollars)
 
-            # --- HARD log required fields (no silent pass) ---
             order_price_cents: Optional[int] = None
             order_count: Optional[int] = None
 
@@ -1778,7 +1748,6 @@ class BotApp:
             else:
                 reasons.append("order_count:missing")
 
-            # Optional: also log yes/no + side for debugging and resolver pairing
             try:
                 reasons.append(f"order_side:{str(order.get('side'))}")
                 reasons.append(f"order_yes_no:{str(order.get('yes_no'))}")
@@ -1846,7 +1815,6 @@ class BotApp:
             "won": None,
             "resolved_ts": None,
             "market_category": chosen.get("category"),
-            # Optional newer columns (safe if StateStore supports them)
             "news_score": float(news.get("score", 0.0)),
             "news_confidence": float(news.get("confidence", 0.0)),
             "news_regime": str(news.get("regime", "unavailable")),
@@ -1855,6 +1823,13 @@ class BotApp:
         }
 
         self._record_decision_row(row)
+        
+        # -----------------------------
+        # Forced DRY_RUN exit pass for any unresolved synthetic positions
+        # -----------------------------
+        if self.settings.DRY_RUN:
+            self._do_dry_run_exit_test_pass(now)
+            
         self._post_tick_housekeeping(snapshot)
 
     def main(self) -> None:

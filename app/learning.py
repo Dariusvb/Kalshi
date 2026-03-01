@@ -37,6 +37,24 @@ def _is_pipeline_test_trade(row: dict) -> bool:
     return ("pipeline_test_entry:1" in reasons) or ("risk:pipeline_test_bypass" in reasons)
 
 
+def _mtm_label(row: dict) -> Optional[str]:
+    """
+    Extract mtm_label:<token> from reasons.
+    If present, we treat this as MTM label quality metadata.
+    """
+    rs = str(row.get("reasons", "") or "")
+    key = "mtm_label:"
+    i = rs.find(key)
+    if i < 0:
+        return None
+    tail = rs[i + len(key) :]
+    j = tail.find(";")
+    if j >= 0:
+        tail = tail[:j]
+    tail = tail.strip()
+    return tail or None
+
+
 def _won_value(row: dict) -> Optional[int]:
     """
     Normalize won field to 1/0/None.
@@ -139,7 +157,7 @@ def _category_bias_info(resolved_trades_desc: List[dict]) -> tuple[Optional[str]
 
     best_cat = max(
         eligible.items(),
-        key=lambda kv: (kv[1]["pnl"], kv[1]["wins"] - kv[1]["losses"])
+        key=lambda kv: (kv[1]["pnl"], kv[1]["wins"] - kv[1]["losses"]),
     )
     cat, m = best_cat
 
@@ -202,6 +220,36 @@ def _weighted_outcome_metrics(outcome_rows_desc: List[dict]) -> dict:
     }
 
 
+def _should_include_in_learning_outcomes(row: dict) -> tuple[bool, str]:
+    """
+    Decide whether a resolved row should be treated as an outcome for learning.
+
+    Policy:
+    - Always exclude pipeline tests.
+    - If mtm_label is present:
+        - include ONLY if mtm_label == 'good'
+        - exclude otherwise (prevents degenerate quotes / fallback labels poisoning learning)
+    - If mtm_label is absent:
+        - include if we have a real outcome signal (won is not None OR realized_pnl is not None)
+    """
+    if _is_pipeline_test_trade(row):
+        return False, "excluded_pipeline_test"
+
+    label = _mtm_label(row)
+    if label is not None:
+        if label == "good":
+            return True, "mtm_good"
+        return False, f"mtm_excluded:{label}"
+
+    # Non-MTM (or legacy MTM without label): require some outcome signal
+    if _won_value(row) is not None:
+        return True, "has_won"
+    if row.get("realized_pnl") is not None:
+        return True, "has_pnl"
+
+    return False, "no_outcome_signal"
+
+
 def compute_learning_adjustment(recent_decisions: List[dict]) -> LearningAdjustment:
     """
     Adaptive sizing/threshold logic.
@@ -230,7 +278,7 @@ def compute_learning_adjustment(recent_decisions: List[dict]) -> LearningAdjustm
             1.0,
             0.0,
             "warmup",
-            [f"all_rows_pipeline_tests:{len(pipeline_test_rows)}"]
+            [f"all_rows_pipeline_tests:{len(pipeline_test_rows)}"],
         )
 
     trades = [d for d in learn_rows if _is_trade(d)]
@@ -254,10 +302,20 @@ def compute_learning_adjustment(recent_decisions: List[dict]) -> LearningAdjustm
     # -----------------------------------------------------------
     # A) Outcome-aware learning (preferred)
     # -----------------------------------------------------------
-    outcome_rows = [
-        r for r in resolved
-        if (_won_value(r) is not None) or (r.get("realized_pnl") is not None)
-    ]
+    outcome_rows: List[dict] = []
+    outcome_rejects = 0
+    for r in resolved:
+        ok, why = _should_include_in_learning_outcomes(r)
+        if ok:
+            outcome_rows.append(r)
+        else:
+            outcome_rejects += 1
+
+    # Helpful diagnostic (won't spam too much)
+    reasons.append(f"resolved_total={len(resolved)}")
+    if outcome_rejects:
+        reasons.append(f"outcome_excluded={outcome_rejects}")
+    reasons.append(f"outcome_used={len(outcome_rows)}")
 
     if len(outcome_rows) >= 5:
         wins = 0
@@ -285,7 +343,6 @@ def compute_learning_adjustment(recent_decisions: List[dict]) -> LearningAdjustm
         w_wr = weighted["weighted_win_rate"]
         w_exp = weighted["weighted_expectancy"]
 
-        reasons.append(f"resolved={len(outcome_rows)}")
         if win_rate is not None:
             reasons.append(f"wr={win_rate*100:.1f}%")
         if w_wr is not None:
@@ -388,7 +445,6 @@ def compute_learning_adjustment(recent_decisions: List[dict]) -> LearningAdjustm
     # B) Proxy fallback / supplement (when outcome data is thin)
     # -----------------------------------------------------------
     else:
-        reasons.append(f"resolved={len(outcome_rows)}")
         reasons.append("using_proxy_logic")
 
         if len(trades) >= 10 and avg_conv >= 68:

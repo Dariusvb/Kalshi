@@ -497,7 +497,7 @@ def resolve_paper_trades(
 
                 # Mark validity gate: reject degenerate quotes / untradable marks
                 unusable = False
-                if spread_i is None or int(spread_i) >= 30:
+                if spread_i is not None and int(spread_i) >= 30:
                     unusable = True
                 if yes_bid_i == 0 and yes_ask_i == 100:
                     unusable = True

@@ -53,6 +53,7 @@ def _parse_number_after(prefix: str, reasons: str) -> Optional[float]:
     Robustly parse number after e.g. 'entry_price_cents:' even if:
       - it's the last token (no trailing ';')
       - reasons contains newlines
+      - token has spaces
     """
     if not reasons:
         return None
@@ -62,7 +63,6 @@ def _parse_number_after(prefix: str, reasons: str) -> Optional[float]:
         return None
     tail = s[idx + len(prefix):]
 
-    # Stop at ';' if present; otherwise take whole tail
     semi = tail.find(";")
     if semi >= 0:
         tail = tail[:semi]
@@ -87,13 +87,21 @@ def _parse_int_after(prefix: str, reasons: str) -> Optional[int]:
         return None
 
 
-def _extract_entry_price_cents(reasons: str) -> Optional[int]:
-    px = _parse_int_after("entry_price_cents:", reasons or "")
-    if px is None:
+def _clamp_cents(v: Any) -> Optional[int]:
+    try:
+        if v is None:
+            return None
+        i = int(round(float(v)))
+        if 1 <= i <= 99:
+            return i
         return None
-    if 1 <= px <= 99:
-        return px
-    return None
+    except Exception:
+        return None
+
+
+def _extract_entry_price_cents(reasons: str) -> Optional[int]:
+    # side price (YES if TRADE_YES; NO if TRADE_NO)
+    return _clamp_cents(_parse_int_after("entry_price_cents:", reasons or ""))
 
 
 def _extract_exit_price_cents(reasons: str) -> Optional[int]:
@@ -104,16 +112,16 @@ def _extract_exit_price_cents(reasons: str) -> Optional[int]:
     px = _parse_int_after("exit_price_cents:", reasons or "")
     if px is None:
         px = _parse_int_after("entry_price_cents:", reasons or "")
-    if px is None:
-        return None
-    if 1 <= px <= 99:
-        return px
-    return None
+    return _clamp_cents(px)
 
 
 def _extract_order_count(reasons: str) -> Optional[int]:
     c = _parse_int_after("order_count:", reasons or "")
     if c is None:
+        return None
+    try:
+        c = int(c)
+    except Exception:
         return None
     return int(max(0, c))
 
@@ -121,6 +129,10 @@ def _extract_order_count(reasons: str) -> Optional[int]:
 def _extract_exit_count(reasons: str) -> Optional[int]:
     c = _parse_int_after("exit_count:", reasons or "")
     if c is None:
+        return None
+    try:
+        c = int(c)
+    except Exception:
         return None
     return int(max(0, c))
 
@@ -130,12 +142,47 @@ def _compute_realized_pnl_from_prices(*, entry_px: int, exit_px: int, count: int
     PnL in *side price space* (YES prices for YES trades, NO prices for NO trades):
       pnl = (exit - entry) * count / 100
     """
-    e = int(max(1, min(99, entry_px)))
-    x = int(max(1, min(99, exit_px)))
-    c = int(max(0, count))
+    e = int(max(1, min(99, int(entry_px))))
+    x = int(max(1, min(99, int(exit_px))))
+    c = int(max(0, int(count)))
     if c <= 0:
         return 0.0
     return float(round(((float(x) - float(e)) * float(c) / 100.0), 4))
+
+
+def _safe_mid_yes_from_summary(s: dict) -> Optional[float]:
+    """
+    Prefer a true mid if possible. Falls back to mid_yes_cents if present.
+    Tries:
+      1) if yes_bid & yes_ask -> (bid+ask)/2
+      2) else if mid_yes_cents -> mid_yes_cents
+      3) else if yes_bid or yes_ask -> whichever exists
+    Returns float cents (not rounded), or None.
+    """
+    try:
+        yb = s.get("yes_bid", None)
+        ya = s.get("yes_ask", None)
+        mid = s.get("mid_yes_cents", None)
+
+        yb_f = None if yb is None else float(yb)
+        ya_f = None if ya is None else float(ya)
+        mid_f = None if mid is None else float(mid)
+
+        if yb_f is not None and ya_f is not None and yb_f > 0 and ya_f > 0:
+            if ya_f >= yb_f:
+                return (yb_f + ya_f) / 2.0
+
+        if mid_f is not None and mid_f > 0:
+            return mid_f
+
+        if ya_f is not None and ya_f > 0:
+            return ya_f
+        if yb_f is not None and yb_f > 0:
+            return yb_f
+    except Exception:
+        return None
+
+    return None
 
 
 def _compute_mtm_pnl_from_mark(
@@ -144,30 +191,34 @@ def _compute_mtm_pnl_from_mark(
     entry_px_side_cents: int,
     mark_yes_cents: int,
     count: int,
-) -> float:
+) -> tuple[float, int, int]:
     """
     MTM using *order_count* (NOT stake inference).
 
     - TRADE_YES: entry_px is YES price; mark uses mid_yes
     - TRADE_NO:  entry_px is NO  price; mark uses mid_no = 100 - mid_yes
+
+    Returns: (pnl, mark_side_cents, entry_side_cents)
     """
     a = str(action or "")
-    c = int(max(0, count))
+    c = int(max(0, int(count)))
     if c <= 0:
-        return 0.0
+        return 0.0, 0, 0
 
-    mark_yes = int(max(1, min(99, mark_yes_cents)))
+    mark_yes_i = int(max(1, min(99, int(mark_yes_cents))))
 
     if a == "TRADE_YES":
-        entry_yes = int(max(1, min(99, entry_px_side_cents)))
-        return _compute_realized_pnl_from_prices(entry_px=entry_yes, exit_px=mark_yes, count=c)
+        entry_yes = int(max(1, min(99, int(entry_px_side_cents))))
+        pnl = _compute_realized_pnl_from_prices(entry_px=entry_yes, exit_px=mark_yes_i, count=c)
+        return pnl, mark_yes_i, entry_yes
 
     if a == "TRADE_NO":
-        mark_no = int(max(1, min(99, 100 - mark_yes)))
-        entry_no = int(max(1, min(99, entry_px_side_cents)))
-        return _compute_realized_pnl_from_prices(entry_px=entry_no, exit_px=mark_no, count=c)
+        mark_no = int(max(1, min(99, 100 - mark_yes_i)))
+        entry_no = int(max(1, min(99, int(entry_px_side_cents))))
+        pnl = _compute_realized_pnl_from_prices(entry_px=entry_no, exit_px=mark_no, count=c)
+        return pnl, mark_no, entry_no
 
-    return 0.0
+    return 0.0, 0, 0
 
 
 def resolve_paper_trades(
@@ -186,9 +237,9 @@ def resolve_paper_trades(
       - Compute realized PnL using entry/exit prices in side-space and count
 
     Pass 2) MTM resolve old entries with no exits:
-      - Uses current mid_yes from market
-      - Uses entry_price_cents + order_count
-      - NO trades use mark_no = 100 - mid_yes
+      - Uses current mark from market (prefers (yes_bid+yes_ask)/2, else mid_yes_cents)
+      - Uses entry_price_cents + order_count from reasons
+      - NO trades use mark_no = 100 - mark_yes
     """
     db_path = _get_db_path_from_store(store)
     now = dt.datetime.now(dt.UTC)
@@ -223,6 +274,12 @@ def resolve_paper_trades(
         """,
         (int(max_to_check),),
     ).fetchall()
+
+    # Use one transaction for the whole run (much faster, fewer partial commits)
+    try:
+        cur.execute("BEGIN;")
+    except Exception:
+        pass
 
     for ex in exit_rows:
         checked += 1
@@ -294,6 +351,18 @@ def resolve_paper_trades(
 
         pnl = _compute_realized_pnl_from_prices(entry_px=int(entry_px), exit_px=int(exit_px), count=int(count_used))
 
+        # sanity: max absolute pnl in dollars is count * $0.99 (since prices are 1..99c)
+        max_abs = float(count_used) * 0.99
+        if abs(pnl) > (max_abs + 1e-6):
+            skipped += 1
+            if logger:
+                logger.warning(
+                    f"PaperResolver (EXIT) sanity-skip id={entry_id} ticker={ticker} "
+                    f"pnl={pnl:.4f} > max_abs={max_abs:.2f} "
+                    f"(entry_px={entry_px} exit_px={exit_px} count={count_used})"
+                )
+            continue
+
         if pnl > 0:
             won_val: Optional[int] = 1
         elif pnl < 0:
@@ -312,6 +381,7 @@ def resolve_paper_trades(
             (float(pnl), int(won_val), now_iso, entry_id),
         )
 
+        # Mark exit as consumed so it can't resolve multiple entries
         cur.execute(
             """
             UPDATE decisions
@@ -321,7 +391,6 @@ def resolve_paper_trades(
             (now_iso, int(ex["id"])),
         )
 
-        con.commit()
         updated += 1
 
         if logger:
@@ -381,7 +450,12 @@ def resolve_paper_trades(
             skipped += 1
             continue
 
-        # Pull current mark (mid_yes)
+        # Pull current mark (prefer true mid from bid/ask)
+        spread_i: Optional[int] = None
+        vol_f: Optional[float] = None
+        mark_yes_f: Optional[float] = None
+        mid_yes_i: Optional[int] = None
+
         try:
             raw_market = client.get_market(str(ticker))
             market_obj = raw_market
@@ -390,29 +464,25 @@ def resolve_paper_trades(
 
             s = summarize_market(market_obj)
 
-            spread = s.get("spread_cents", None)
-            vol = s.get("volume", None)
-            mid_yes = s.get("mid_yes_cents", None)
-
-            spread_i = None
             try:
-                spread_i = None if spread is None else int(round(float(spread)))
+                spread_i = None if s.get("spread_cents") is None else int(round(float(s.get("spread_cents"))))
             except Exception:
                 spread_i = None
 
-            vol_f = None
             try:
-                vol_f = None if vol is None else float(vol)
+                vol_f = None if s.get("volume") is None else float(s.get("volume"))
             except Exception:
                 vol_f = None
 
-            mid_i = None
-            try:
-                mid_i = None if mid_yes is None else int(round(float(mid_yes)))
-            except Exception:
-                mid_i = None
+            mark_yes_f = _safe_mid_yes_from_summary(s)
+            if mark_yes_f is None:
+                skipped += 1
+                continue
 
-            if mid_i is None or not (1 <= mid_i <= 99):
+            # Round ONLY at the end so we don't destroy the signal by truncation too early
+            mid_yes_i = int(round(mark_yes_f))
+
+            if mid_yes_i is None or not (1 <= mid_yes_i <= 99):
                 skipped += 1
                 continue
 
@@ -430,12 +500,24 @@ def resolve_paper_trades(
             skipped += 1
             continue
 
-        pnl = _compute_mtm_pnl_from_mark(
+        pnl, mark_side_px, entry_side_px = _compute_mtm_pnl_from_mark(
             action=action,
             entry_px_side_cents=int(entry_px),
-            mark_yes_cents=int(mid_i),
+            mark_yes_cents=int(mid_yes_i),
             count=int(count),
         )
+
+        # sanity: absolute PnL can't exceed count * $0.99
+        max_abs = float(count) * 0.99
+        if abs(pnl) > (max_abs + 1e-6):
+            skipped += 1
+            if logger:
+                logger.warning(
+                    f"PaperResolver (MTM) sanity-skip id={int(r['id'])} ticker={ticker} action={action} "
+                    f"pnl={pnl:.4f} > max_abs={max_abs:.2f} "
+                    f"(entry_side_px={entry_side_px} mark_yes={mid_yes_i} mark_side_px={mark_side_px} count={count})"
+                )
+            continue
 
         if abs(pnl) < float(flat_pnl_epsilon):
             won_val = None
@@ -458,14 +540,23 @@ def resolve_paper_trades(
             ),
         )
 
-        con.commit()
         updated += 1
 
+        # ✅ Upgraded MTM log line (more forensic + shows side-space clearly)
         if logger:
+            mid_no_i = 100 - int(mid_yes_i)
             logger.info(
-                f"PaperResolver (MTM) resolved id={int(r['id'])} ticker={ticker} action={action} "
-                f"entry_px={entry_px} count={count} mark_yes={mid_i} pnl={pnl:.4f} won={won_val}"
+                "PaperResolver (MTM) resolved "
+                f"id={int(r['id'])} age_min={age_min:.1f} ticker={ticker} action={action} "
+                f"entry_side_px={entry_side_px}c mark_yes={int(mid_yes_i)}c mark_no={mid_no_i}c mark_side_px={mark_side_px}c "
+                f"count={int(count)} pnl=${pnl:.4f} won={won_val} "
+                f"spread_cents={spread_i} volume={None if vol_f is None else round(vol_f, 2)}"
             )
+
+    try:
+        con.commit()
+    except Exception:
+        pass
 
     con.close()
     return PaperResolutionResult(updated=updated, checked=checked, skipped=skipped)

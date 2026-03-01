@@ -20,6 +20,9 @@ class PaperResolutionResult:
 PaperResolveResult = PaperResolutionResult
 
 
+# Bump this any time you change resolver logic materially.
+_RESOLVER_VERSION = 2
+
 _RE_NUM = re.compile(r"([-+]?\d+(?:\.\d+)?)")
 
 
@@ -100,7 +103,6 @@ def _clamp_cents(v: Any) -> Optional[int]:
 
 
 def _extract_entry_price_cents(reasons: str) -> Optional[int]:
-    # side price (YES if TRADE_YES; NO if TRADE_NO)
     return _clamp_cents(_parse_int_after("entry_price_cents:", reasons or ""))
 
 
@@ -198,6 +200,164 @@ def _compute_mtm_pnl_from_mark(
     return 0.0
 
 
+def _unwrap_market_payload(raw: Any) -> Optional[dict]:
+    """
+    Normalize multiple possible client payload layouts into a market dict that summarize_market can handle.
+    Accepts:
+      - dict already containing "ticker"
+      - {market: {...}}
+      - {data: {market: {...}}}
+      - {result: {...}}, {response: {...}} nesting
+    """
+    if isinstance(raw, dict):
+        # Common wrappers
+        for outer in ("market", "data", "result", "response"):
+            v = raw.get(outer)
+            if isinstance(v, dict):
+                # wrapper may still wrap the market object
+                if "ticker" in v:
+                    return v
+                for inner in ("market", "data", "result", "response"):
+                    vv = v.get(inner)
+                    if isinstance(vv, dict) and "ticker" in vv:
+                        return vv
+        if "ticker" in raw:
+            return raw
+    return None
+
+
+def _append_tag(reasons: str, tag: str) -> str:
+    rs = str(reasons or "")
+    if not tag:
+        return rs
+    if tag in rs:
+        return rs
+    if rs and not rs.endswith(";"):
+        rs += ";"
+    return rs + tag + ";"
+
+
+def _safe_mark_yes_from_summary(s: dict) -> tuple[Optional[int], str]:
+    """
+    Return (mark_yes_cents, source).
+    Prefers mid_yes; falls back to avg(bid,ask); then bid; then ask.
+    """
+    mid = s.get("mid_yes_cents")
+    bid = s.get("yes_bid")
+    ask = s.get("yes_ask")
+
+    def _to_int(x) -> Optional[int]:
+        try:
+            if x is None:
+                return None
+            v = int(round(float(x)))
+            if 1 <= v <= 99:
+                return v
+        except Exception:
+            return None
+        return None
+
+    mid_i = _to_int(mid)
+    if mid_i is not None:
+        return mid_i, "mid_yes"
+
+    bid_i = _to_int(bid)
+    ask_i = _to_int(ask)
+
+    if bid_i is not None and ask_i is not None and ask_i >= bid_i:
+        return int(round((bid_i + ask_i) / 2.0)), "avg_bid_ask"
+    if bid_i is not None:
+        return bid_i, "bid_only"
+    if ask_i is not None:
+        return ask_i, "ask_only"
+    return None, "no_quote"
+
+
+def _client_fetch_market_summary(
+    *,
+    client: Any,
+    ticker: str,
+    logger: Any = None,
+    fallback_scan_pages: int = 2,
+    fallback_scan_limit: int = 200,
+) -> tuple[Optional[dict], str]:
+    """
+    Bulletproof market fetch:
+      1) try client.get_market(ticker)
+      2) fallback: client.get_markets(limit=..., cursor=...) and scan for ticker
+
+    Returns (summary_dict, fetch_mode)
+      - summary_dict is result of summarize_market(market_obj) OR None
+    """
+    t = str(ticker or "").strip()
+    if not t:
+        return None, "no_ticker"
+
+    # 1) get_market if exists
+    try:
+        gm = getattr(client, "get_market", None)
+        if callable(gm):
+            raw = gm(t)
+            mo = _unwrap_market_payload(raw) if raw is not None else None
+            if mo:
+                return summarize_market(mo), "get_market"
+    except Exception as e:
+        if logger:
+            logger.warning(f"PaperResolver: get_market failed for {t}: {type(e).__name__}:{e}")
+
+    # 2) fallback scan get_markets
+    try:
+        gms = getattr(client, "get_markets", None)
+        if not callable(gms):
+            return None, "no_get_markets"
+
+        cursor: Optional[str] = None
+        for _ in range(max(1, int(fallback_scan_pages))):
+            try:
+                raw = gms(limit=int(fallback_scan_limit), cursor=cursor)
+            except TypeError:
+                raw = gms(limit=int(fallback_scan_limit))
+
+            markets = None
+            if isinstance(raw, dict):
+                for k in ("markets", "data", "result", "response"):
+                    v = raw.get(k)
+                    if isinstance(v, list):
+                        markets = v
+                        break
+                    if isinstance(v, dict) and isinstance(v.get("markets"), list):
+                        markets = v.get("markets")
+                        break
+                if markets is None and isinstance(raw.get("markets"), list):
+                    markets = raw.get("markets")
+            elif isinstance(raw, list):
+                markets = raw
+
+            if not isinstance(markets, list):
+                break
+
+            for m in markets:
+                if isinstance(m, dict) and str(m.get("ticker") or "").strip() == t:
+                    try:
+                        return summarize_market(m), "scan_get_markets"
+                    except Exception:
+                        return None, "scan_get_markets_summarize_failed"
+
+            # cursor advance if available
+            if isinstance(raw, dict):
+                cursor = raw.get("cursor")
+                if not cursor:
+                    break
+            else:
+                break
+    except Exception as e:
+        if logger:
+            logger.warning(f"PaperResolver: scan_get_markets failed for {t}: {type(e).__name__}:{e}")
+        return None, "scan_get_markets_failed"
+
+    return None, "not_found"
+
+
 def resolve_paper_trades(
     *,
     store: Any,
@@ -228,6 +388,12 @@ def resolve_paper_trades(
           * if mid-age: keep deferring (leave unresolved)
           * if very old: resolve to pnl=0 + mtm_label:unusable_quote (so it doesn't stall forever)
       - Adds mtm_label tags so training can skip unlearnable rows
+
+    HARDENING:
+      - Guarded updates (resolved_ts IS NULL in WHERE) to prevent double-resolve
+      - Exit consumption only happens if entry update succeeds
+      - Compatible with clients without get_market (scans get_markets)
+      - Adds resolver_version tag for auditability
     """
     db_path = _get_db_path_from_store(store)
     now = dt.datetime.now(dt.UTC)
@@ -248,51 +414,6 @@ def resolve_paper_trades(
         con.close()
         raise RuntimeError(f"decisions table not found or unreadable in {db_path}: {e}")
 
-    def _append_tag(reasons: str, tag: str) -> str:
-        rs = str(reasons or "")
-        if not tag:
-            return rs
-        if tag in rs:
-            return rs
-        if rs and not rs.endswith(";"):
-            rs += ";"
-        return rs + tag + ";"
-
-    def _safe_mark_yes_from_summary(s: dict) -> tuple[Optional[int], str]:
-        """
-        Return (mark_yes_cents, source).
-        Prefers mid_yes; falls back to avg(bid,ask); then bid; then ask.
-        """
-        mid = s.get("mid_yes_cents")
-        bid = s.get("yes_bid")
-        ask = s.get("yes_ask")
-
-        def _to_int(x) -> Optional[int]:
-            try:
-                if x is None:
-                    return None
-                v = int(round(float(x)))
-                if 1 <= v <= 99:
-                    return v
-            except Exception:
-                return None
-            return None
-
-        mid_i = _to_int(mid)
-        if mid_i is not None:
-            return mid_i, "mid_yes"
-
-        bid_i = _to_int(bid)
-        ask_i = _to_int(ask)
-
-        if bid_i is not None and ask_i is not None and ask_i >= bid_i:
-            return int(round((bid_i + ask_i) / 2.0)), "avg_bid_ask"
-        if bid_i is not None:
-            return bid_i, "bid_only"
-        if ask_i is not None:
-            return ask_i, "ask_only"
-        return None, "no_quote"
-
     # Learning hygiene: don't label pennies as win/loss
     flat_pnl_epsilon = 0.01
 
@@ -303,8 +424,8 @@ def resolve_paper_trades(
     unusable_defer_minutes = 60               # don't label unusable quotes for at least 60 minutes
     unusable_force_resolve_minutes = 12 * 60  # after 12 hours, force resolve to 0.0 (so it can't stall forever)
 
-    # Single safe transaction for both passes
     try:
+        # Single safe transaction for both passes
         try:
             cur.execute("BEGIN;")
         except Exception:
@@ -376,7 +497,7 @@ def resolve_paper_trades(
                     (int(prefer_entry_id),),
                 ).fetchone()
 
-                # If the pointed entry doesn't match ticker/side, don't force it
+                # Validate pointed entry matches ticker/side
                 if ent:
                     ent_tkr = str(ent["ticker"] or "").strip()
                     ent_action = str(ent["action"] or "")
@@ -450,13 +571,20 @@ def resolve_paper_trades(
                 f"exit_px_cents:{int(exit_px)}",
                 f"exit_cnt:{int(count_used)}",
                 f"exit_side:{held_side}",
+                f"resolver_version:{_RESOLVER_VERSION}",
             ):
                 entry_new_reasons = _append_tag(entry_new_reasons, tg)
 
             exit_new_reasons = exit_reasons
-            for tg in ("exit_consumed:1", f"entry_id:{entry_id}", "exit_resolve_reason:explicit"):
+            for tg in (
+                "exit_consumed:1",
+                f"entry_id:{entry_id}",
+                "exit_resolve_reason:explicit",
+                f"resolver_version:{_RESOLVER_VERSION}",
+            ):
                 exit_new_reasons = _append_tag(exit_new_reasons, tg)
 
+            # Guarded entry update: only resolve if still unresolved
             cur.execute(
                 """
                 UPDATE decisions
@@ -465,19 +593,41 @@ def resolve_paper_trades(
                     resolved_ts = ?,
                     reasons = ?
                 WHERE id = ?
+                  AND resolved_ts IS NULL
                 """,
                 (float(pnl), int(won_val), now_iso, entry_new_reasons, entry_id),
             )
+            entry_rowcount = int(getattr(cur, "rowcount", 0) or 0)
+            if entry_rowcount != 1:
+                # Someone else resolved it; do NOT consume exit.
+                skipped += 1
+                if logger:
+                    logger.warning(
+                        "PaperResolver (EXIT) guarded-skip (entry not updated) "
+                        f"entry_id={entry_id} exit_id={int(ex['id'])} rowcount={entry_rowcount}"
+                    )
+                continue
 
+            # Guarded exit consumption: only consume if still unconsumed
             cur.execute(
                 """
                 UPDATE decisions
                 SET resolved_ts = ?,
                     reasons = ?
                 WHERE id = ?
+                  AND resolved_ts IS NULL
                 """,
                 (now_iso, exit_new_reasons, int(ex["id"])),
             )
+            exit_rowcount = int(getattr(cur, "rowcount", 0) or 0)
+            if exit_rowcount != 1:
+                # Rare: exit got consumed concurrently; keep entry resolved but tag that exit wasn't consumed.
+                # (We don't rollback entry because it's already safe + consistent; exit will be skipped later.)
+                if logger:
+                    logger.warning(
+                        "PaperResolver (EXIT) exit-consume-miss "
+                        f"entry_id={entry_id} exit_id={int(ex['id'])} rowcount={exit_rowcount}"
+                    )
 
             updated += 1
 
@@ -545,14 +695,20 @@ def resolve_paper_trades(
             yes_bid_i: Optional[int] = None
             yes_ask_i: Optional[int] = None
 
-            # Fetch mark
+            # Fetch mark (bulletproof)
             try:
-                raw_market = client.get_market(str(ticker))
-                market_obj = raw_market
-                if isinstance(raw_market, dict) and isinstance(raw_market.get("market"), dict):
-                    market_obj = raw_market["market"]
+                s = None
+                summary, fetch_mode = _client_fetch_market_summary(
+                    client=client,
+                    ticker=ticker,
+                    logger=logger,
+                    fallback_scan_pages=2,
+                    fallback_scan_limit=200,
+                )
+                if summary is None:
+                    raise RuntimeError(f"market_not_found:{fetch_mode}")
 
-                s = summarize_market(market_obj)
+                s = summary
                 status_s = str(s.get("status", "") or "")
 
                 try:
@@ -575,7 +731,8 @@ def resolve_paper_trades(
                 except Exception:
                     yes_ask_i = None
 
-                mark_yes_i, mark_src = _safe_mark_yes_from_summary(s)
+                mark_yes_i, mark_src0 = _safe_mark_yes_from_summary(s)
+                mark_src = f"{fetch_mode}:{mark_src0}"
                 if mark_yes_i is None:
                     raise RuntimeError("no_usable_mark_yes")
 
@@ -631,7 +788,7 @@ def resolve_paper_trades(
                             f"status={status_s} spread={spread_i} bid={yes_bid_i} ask={yes_ask_i} mark_src={mark_src}"
                         )
                     continue
-                # else: fall through and force-resolve with pnl=0 + mtm_label:unusable_quote
+                # else: force-resolve with pnl=0 + mtm_label:unusable_quote
 
             # Compute MTM pnl
             if mark_yes_i is None:
@@ -657,14 +814,17 @@ def resolve_paper_trades(
                 won_val_log = bool(pnl > 0)
                 won_val_db = 1 if won_val_log else 0
 
-            # Tag for learning hygiene
+            # Tag for learning hygiene + audit
+            reasons2 = reasons
+            reasons2 = _append_tag(reasons2, f"resolver_version:{_RESOLVER_VERSION}")
             if mtm_reason == "ok":
-                reasons2 = _append_tag(reasons, "mtm_label:good")
+                reasons2 = _append_tag(reasons2, "mtm_label:good")
             elif mtm_reason == "unusable_quote":
-                reasons2 = _append_tag(reasons, "mtm_label:unusable_quote")
+                reasons2 = _append_tag(reasons2, "mtm_label:unusable_quote")
             else:
-                reasons2 = _append_tag(reasons, "mtm_label:market_fetch_failed")
+                reasons2 = _append_tag(reasons2, "mtm_label:market_fetch_failed")
 
+            # Guarded update: only resolve if still unresolved
             cur.execute(
                 """
                 UPDATE decisions
@@ -673,9 +833,19 @@ def resolve_paper_trades(
                     resolved_ts = ?,
                     reasons = ?
                 WHERE id = ?
+                  AND resolved_ts IS NULL
                 """,
                 (float(pnl), won_val_db, now_iso, reasons2, int(r["id"])),
             )
+            rc = int(getattr(cur, "rowcount", 0) or 0)
+            if rc != 1:
+                skipped += 1
+                if logger:
+                    logger.warning(
+                        "PaperResolver (MTM) guarded-skip (row not updated) "
+                        f"id={int(r['id'])} rowcount={rc} ticker={ticker}"
+                    )
+                continue
 
             updated += 1
 
@@ -703,3 +873,34 @@ def resolve_paper_trades(
         con.close()
 
     return PaperResolutionResult(updated=updated, checked=checked, skipped=skipped)
+
+
+# -----------------------------
+# Optional self-checks (won't run unless you execute this module directly)
+# -----------------------------
+def run_self_checks() -> None:
+    # Parsing checks
+    rs = "foo;entry_price_cents: 51;order_count:2;bar"
+    assert _extract_entry_price_cents(rs) == 51
+    assert _extract_order_count(rs) == 2
+
+    rs2 = "exit_price_cents:49; exit_count: 2 ; entry_id:123;"
+    assert _extract_exit_price_cents(rs2) == 49
+    assert _extract_exit_count(rs2) == 2
+    assert _extract_exit_entry_id(rs2) == 123
+
+    # Clamp checks
+    assert _clamp_cents(0) is None
+    assert _clamp_cents(1) == 1
+    assert _clamp_cents(99) == 99
+    assert _clamp_cents(100) is None
+
+    # PnL sanity checks
+    assert _compute_realized_pnl_from_prices(entry_px=50, exit_px=60, count=2) == 0.2
+    assert _compute_mtm_pnl_from_mark(action="TRADE_NO", entry_px_side_cents=60, mark_yes_cents=40, count=1) == 0.0
+
+    print("paper_resolver.py self-checks passed.")
+
+
+if __name__ == "__main__":
+    run_self_checks()

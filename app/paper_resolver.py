@@ -259,6 +259,7 @@ def resolve_paper_trades(
         for ex in exit_rows:
             checked += 1
 
+            # already consumed
             if ex["resolved_ts"] is not None:
                 skipped += 1
                 continue
@@ -290,6 +291,7 @@ def resolve_paper_trades(
                 skipped += 1
                 continue
 
+            # Find latest unresolved matching entry
             ent = cur.execute(
                 """
                 SELECT id, ts, ticker, action, dry_run, reasons, resolved_ts
@@ -313,18 +315,23 @@ def resolve_paper_trades(
             entry_px = _extract_entry_price_cents(entry_reasons)
             entry_cnt = _extract_order_count(entry_reasons)
 
-            if entry_px is None or entry_cnt is None or entry_cnt <= 0:
+            if entry_px is None or entry_cnt is None or int(entry_cnt) <= 0:
                 skipped += 1
                 continue
 
+            # Use min(entry_cnt, exit_cnt) if exit_count provided
             count_used = int(entry_cnt)
-            if exit_cnt is not None and exit_cnt > 0:
-                count_used = int(min(count_used, exit_cnt))
+            if exit_cnt is not None and int(exit_cnt) > 0:
+                count_used = int(min(count_used, int(exit_cnt)))
             if count_used <= 0:
                 skipped += 1
                 continue
 
-            pnl = _compute_realized_pnl_from_prices(entry_px=int(entry_px), exit_px=int(exit_px), count=int(count_used))
+            pnl = _compute_realized_pnl_from_prices(
+                entry_px=int(entry_px),
+                exit_px=int(exit_px),
+                count=int(count_used),
+            )
 
             # Sanity: max absolute pnl in dollars is count * $0.99
             max_abs = float(count_used) * 0.99
@@ -332,43 +339,77 @@ def resolve_paper_trades(
                 skipped += 1
                 if logger:
                     logger.warning(
-                        f"PaperResolver (EXIT) sanity-skip id={entry_id} ticker={ticker} "
+                        "PaperResolver (EXIT) sanity-skip "
+                        f"entry_id={entry_id} exit_id={int(ex['id'])} ticker={ticker} side={held_side} "
                         f"pnl={float(pnl):.4f} > max_abs={max_abs:.2f} "
-                        f"(entry_px={entry_px} exit_px={exit_px} count={count_used})"
+                        f"(entry_px={entry_px} exit_px={exit_px} count_used={count_used})"
                     )
                 continue
 
-            won_val: int = 1 if pnl > 0 else 0
+            # Won/lost: for explicit exits we always classify (0 pnl => loss)
+            won_val: int = 1 if float(pnl) > 0 else 0
 
-            # Update entry
+            # Optional: tag both rows for auditability
+            exit_tag = "exit_consumed:1"
+            exit_reason_tag = "exit_resolve_reason:explicit"
+            entry_tag = "exit_resolved:1"
+
+            # Update entry (realized pnl + won + resolved_ts + tag)
             cur.execute(
                 """
                 UPDATE decisions
                 SET realized_pnl = ?,
                     won = ?,
-                    resolved_ts = ?
+                    resolved_ts = ?,
+                    reasons = CASE
+                        WHEN COALESCE(reasons,'') LIKE '%' || ? || '%'
+                        THEN COALESCE(reasons,'')
+                        ELSE COALESCE(reasons,'') || ';' || ?
+                    END
                 WHERE id = ?
                 """,
-                (float(pnl), int(won_val), now_iso, entry_id),
+                (float(pnl), int(won_val), now_iso, entry_tag, entry_tag, entry_id),
             )
 
-            # Mark exit as consumed so it can't resolve multiple entries
+            # Mark exit as consumed so it can't resolve multiple entries (and tag it)
             cur.execute(
                 """
                 UPDATE decisions
-                SET resolved_ts = ?
+                SET resolved_ts = ?,
+                    reasons = CASE
+                        WHEN COALESCE(reasons,'') LIKE '%' || ? || '%'
+                             AND COALESCE(reasons,'') LIKE '%' || ? || '%'
+                        THEN COALESCE(reasons,'')
+                        WHEN COALESCE(reasons,'') LIKE '%' || ? || '%'
+                        THEN COALESCE(reasons,'') || ';' || ?
+                        WHEN COALESCE(reasons,'') LIKE '%' || ? || '%'
+                        THEN COALESCE(reasons,'') || ';' || ?
+                        ELSE COALESCE(reasons,'') || ';' || ? || ';' || ?
+                    END
                 WHERE id = ?
                 """,
-                (now_iso, int(ex["id"])),
+                (
+                    now_iso,
+                    exit_tag,
+                    exit_reason_tag,
+                    exit_tag,
+                    exit_reason_tag,
+                    exit_reason_tag,
+                    exit_tag,
+                    exit_tag,
+                    exit_reason_tag,
+                    int(ex["id"]),
+                ),
             )
 
             updated += 1
 
             if logger:
                 logger.info(
-                    f"PaperResolver (EXIT) resolved ticker={ticker} side={held_side} "
-                    f"entry_id={entry_id} exit_id={int(ex['id'])} entry_px={entry_px} exit_px={exit_px} "
-                    f"count={count_used} pnl={float(pnl):.4f} won={won_val}"
+                    "PaperResolver (EXIT) resolved "
+                    f"ticker={ticker} side={held_side} entry_id={entry_id} exit_id={int(ex['id'])} "
+                    f"entry_px={int(entry_px)} exit_px={int(exit_px)} count={count_used} "
+                    f"pnl={float(pnl):.4f} won={won_val}"
                 )
 
         # -----------------------------

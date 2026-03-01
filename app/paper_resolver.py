@@ -150,41 +150,6 @@ def _compute_realized_pnl_from_prices(*, entry_px: int, exit_px: int, count: int
     return float(round(((float(x) - float(e)) * float(c) / 100.0), 4))
 
 
-def _safe_mid_yes_from_summary(s: dict) -> Optional[float]:
-    """
-    Prefer a true mid if possible. Falls back to mid_yes_cents if present.
-    Tries:
-      1) if yes_bid & yes_ask -> (bid+ask)/2
-      2) else if mid_yes_cents -> mid_yes_cents
-      3) else if yes_bid or yes_ask -> whichever exists
-    Returns float cents (not rounded), or None.
-    """
-    try:
-        yb = s.get("yes_bid", None)
-        ya = s.get("yes_ask", None)
-        mid = s.get("mid_yes_cents", None)
-
-        yb_f = None if yb is None else float(yb)
-        ya_f = None if ya is None else float(ya)
-        mid_f = None if mid is None else float(mid)
-
-        if yb_f is not None and ya_f is not None and yb_f > 0 and ya_f > 0:
-            if ya_f >= yb_f:
-                return (yb_f + ya_f) / 2.0
-
-        if mid_f is not None and mid_f > 0:
-            return mid_f
-
-        if ya_f is not None and ya_f > 0:
-            return ya_f
-        if yb_f is not None and yb_f > 0:
-            return yb_f
-    except Exception:
-        return None
-
-    return None
-
-
 def _compute_mtm_pnl_from_mark(
     *,
     action: str,
@@ -238,7 +203,7 @@ def resolve_paper_trades(
       - Uses current mark from market (prefers mid_yes; else avg(bid,ask); else bid/ask)
       - Uses entry_price_cents + order_count from reasons
       - NO trades use mark_no = 100 - mark_yes
-      - If market fetch fails -> resolves with pnl=0 (does not stall forever)
+      - If market fetch fails OR quote is unusable -> resolves with pnl=0 (does not stall forever)
     """
     db_path = _get_db_path_from_store(store)
     now = dt.datetime.now(dt.UTC)
@@ -490,6 +455,10 @@ def resolve_paper_trades(
         status_s: Optional[str] = None
         mtm_reason = "ok"
 
+        # capture bid/ask for mark-quality gating
+        yes_bid_i: Optional[int] = None
+        yes_ask_i: Optional[int] = None
+
         try:
             raw_market = client.get_market(str(ticker))
             market_obj = raw_market
@@ -509,9 +478,35 @@ def resolve_paper_trades(
             except Exception:
                 vol_f = None
 
+            try:
+                yes_bid_i = None if s.get("yes_bid") is None else int(round(float(s.get("yes_bid"))))
+            except Exception:
+                yes_bid_i = None
+
+            try:
+                yes_ask_i = None if s.get("yes_ask") is None else int(round(float(s.get("yes_ask"))))
+            except Exception:
+                yes_ask_i = None
+
             mark_yes_i, mark_src = _safe_mark_yes_from_summary(s)
             if mark_yes_i is None:
                 raise RuntimeError("no_usable_mark_yes")
+
+            # --- Mark validity gate: reject degenerate quotes like (bid=0, ask=100, mid=50, spread=100) ---
+            unusable = False
+            if spread_i is None or int(spread_i) >= 30:
+                unusable = True
+            if yes_bid_i == 0 and yes_ask_i == 100:
+                unusable = True
+            if mark_yes_i == 50 and spread_i == 100:
+                unusable = True
+            if mark_src == "mid_yes" and yes_bid_i == 0 and yes_ask_i == 100:
+                unusable = True
+
+            if unusable:
+                mtm_reason = "unusable_quote"
+                mark_src = f"rejected:{mark_src}"
+                mark_yes_i = None
 
         except Exception as e:
             # Bulletproof: if we can't fetch/parse the market, resolve with pnl=0 instead of stalling forever.
@@ -571,7 +566,7 @@ def resolve_paper_trades(
                 f"id={int(r['id'])} age_min={age_min:.1f} ticker={ticker} side={side} action={action} "
                 f"entry_px_side={int(entry_px)} count={int(count)} "
                 f"mark_yes={mark_yes_i} mark_no={mark_no} mark_src={mark_src} "
-                f"status={status_s} spread={spread_i} vol={vol_f} "
+                f"status={status_s} spread={spread_i} bid={yes_bid_i} ask={yes_ask_i} vol={vol_f} "
                 f"pnl={pnl:.4f} won={won_val_log} mtm_reason={mtm_reason}"
             )
 
